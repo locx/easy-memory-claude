@@ -4,7 +4,7 @@
 #
 # Creates a self-contained JSON file with graph data + metadata.
 # Transfer via git, cloud storage, or sneakernet.
-# #5: Passes paths via sys.argv — no shell interpolation into Python.
+# Passes paths via sys.argv — no shell interpolation into Python.
 set -euo pipefail
 
 PROJECT_DIR="${1:-$(pwd)}"
@@ -20,6 +20,14 @@ if [ ! -f "$GRAPH" ]; then
     exit 1
 fi
 
+# Size guard — reject graphs larger than 50MB
+GRAPH_SIZE=$(wc -c < "$GRAPH" | tr -d ' ')
+if [ "$GRAPH_SIZE" -gt 52428800 ]; then
+    echo "ERROR: Graph too large (${GRAPH_SIZE} bytes, max 50MB)"
+    echo "Run maintenance to prune first: python3 ~/.claude/memory/maintenance.py ${PROJECT_DIR}"
+    exit 1
+fi
+
 # Default output: project-name_memory_YYYY-MM-DD.json
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 DATE=$(date +%Y-%m-%d)
@@ -32,9 +40,11 @@ graph_path = sys.argv[1]
 project_name = sys.argv[2]
 output_path = sys.argv[3]
 
-entries = []
+# Stream entries to output — avoid loading all into list.
+# Two-pass: count first, then stream to output JSON.
 entity_count = 0
 relation_count = 0
+total_count = 0
 with open(graph_path, encoding='utf-8') as f:
     for line in f:
         line = line.strip()
@@ -42,7 +52,7 @@ with open(graph_path, encoding='utf-8') as f:
             try:
                 obj = json.loads(line)
                 if isinstance(obj, dict):
-                    entries.append(obj)
+                    total_count += 1
                     t = obj.get('type')
                     if t == 'entity':
                         entity_count += 1
@@ -51,27 +61,53 @@ with open(graph_path, encoding='utf-8') as f:
             except json.JSONDecodeError:
                 continue
 
-bundle = {
-    'format': 'easy-memory-claude-export',
-    'version': 1,
-    'exported': time.strftime(
-        '%Y-%m-%dT%H:%M:%SZ', time.gmtime()
-    ),
-    'project': project_name,
-    'stats': {
-        'entities': entity_count,
-        'relations': relation_count,
-        'total_entries': len(entries),
-    },
-    'entries': entries,
-}
-
-# Atomic write
+# Stream write: header, then entries one by one, then close
+sep = (',', ':')
 tmp = output_path + '.tmp'
 try:
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(bundle, f, indent=2)
-        f.write('\n')
+    with open(tmp, 'w', encoding='utf-8') as out:
+        # Write header
+        header = {
+            'format': 'easy-memory-claude-export',
+            'version': 1,
+            'exported': time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ', time.gmtime()
+            ),
+            'project': project_name,
+            'stats': {
+                'entities': entity_count,
+                'relations': relation_count,
+                'total_entries': total_count,
+            },
+        }
+        # Write everything except closing brace
+        header_json = json.dumps(header, indent=2)
+        # Remove trailing "}" and append entries array
+        out.write(header_json[:-1])
+        out.write(',\n  "entries": [\n')
+
+        # Stream entries from graph
+        first = True
+        with open(graph_path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if not isinstance(obj, dict):
+                        continue
+                except json.JSONDecodeError:
+                    continue
+                if not first:
+                    out.write(',\n')
+                out.write('    ')
+                json.dump(obj, out, separators=sep)
+                first = False
+
+        out.write('\n  ]\n}\n')
+        out.flush()
+        os.fsync(out.fileno())
     os.replace(tmp, output_path)
 except BaseException:
     try:

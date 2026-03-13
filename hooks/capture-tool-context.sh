@@ -11,7 +11,8 @@
 
 MEMORY_DIR="${CLAUDE_PROJECT_DIR}/.memory"
 GRAPH="${MEMORY_DIR}/graph.jsonl"
-[ -f "$GRAPH" ] || exit 0
+# Create graph if missing — resilient bootstrapping
+[ -f "$GRAPH" ] || touch "$GRAPH"
 
 SAFE_SID="${CLAUDE_SESSION_ID//[^a-zA-Z0-9_-]/_}"
 
@@ -39,58 +40,9 @@ chmod 600 "$TMPINPUT"
 trap 'rm -f "$TMPINPUT" 2>/dev/null' EXIT
 head -c 51200 > "$TMPINPUT"
 
-# Python reads from file — no shell variable interpolation
-python3 - "$TMPINPUT" "$GRAPH" << 'PYEOF'
-import json, os, sys, time
-
-input_path = sys.argv[1]
-graph_path = sys.argv[2]
-
-try:
-    with open(input_path, encoding="utf-8") as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(0)
-
-tool = data.get('tool_name', '')
-if tool not in ('Edit', 'Write', 'Bash', 'NotebookEdit'):
-    sys.exit(2)  # non-matching tool — don't update throttle marker
-
-# Build a terse observation
-if tool == 'Edit':
-    path = data.get('tool_input', {}).get('file_path', '?')
-    obs = f'Edited {os.path.basename(path)}'
-elif tool == 'Write':
-    path = data.get('tool_input', {}).get('file_path', '?')
-    obs = f'Created/wrote {os.path.basename(path)}'
-elif tool == 'Bash':
-    cmd = str(data.get('tool_input', {}).get('command', ''))[:80]
-    obs = f'Ran: {cmd}'
-else:
-    obs = f'{tool} used'
-
-ts = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-observation = f'[{ts}] {obs}'
-
-# Append-only — just add a new line to the graph.
-# The session-activity entity accumulates observations as
-# separate entity lines. maintenance.py consolidation will
-# merge them on next run (same name + type = merge).
-entry = json.dumps({
-    'type': 'entity',
-    'name': 'session-activity',
-    'entityType': 'activity-log',
-    'observations': [observation],
-    '_created': ts,
-    '_updated': ts,
-}, separators=(',', ':'))
-
-try:
-    with open(graph_path, 'a', encoding="utf-8") as f:
-        f.write(entry + '\n')
-except OSError:
-    pass
-PYEOF
+# Use standalone .py for bytecode caching (.pyc)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+python3 "${SCRIPT_DIR}/capture_tool_context.py" "$TMPINPUT" "$GRAPH"
 PY_EXIT=$?
 
 # Update throttle marker only after successful capture

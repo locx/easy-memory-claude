@@ -4,8 +4,8 @@
 #
 # Merges entities from the bundle, deduplicating by name+type.
 # Creates a backup before merging.
-# #5: Passes paths via sys.argv — no shell interpolation into Python.
-# #30: Validates imported entity structure.
+# Passes paths via sys.argv — no shell interpolation into Python.
+# Validates imported entity structure.
 set -euo pipefail
 
 BUNDLE="${1:?Usage: import-memory.sh <bundle_file> [project_dir]}"
@@ -27,7 +27,7 @@ if [ ! -d "$MEMORY_DIR" ]; then
     exit 1
 fi
 
-# P3-4: Reject bundles larger than 50MB
+# Reject bundles larger than 50MB
 BUNDLE_SIZE=$(wc -c < "$BUNDLE" | tr -d ' ')
 if [ "$BUNDLE_SIZE" -gt 52428800 ]; then
     echo "ERROR: Bundle too large (${BUNDLE_SIZE} bytes, max 50MB)"
@@ -51,7 +51,7 @@ with open(bundle_path, encoding='utf-8') as f:
     bundle = json.load(f)
 
 fmt = bundle.get('format', '')
-if fmt not in ('easy-memory-claude-export', 'mem-handler-export'):
+if fmt not in ('easy-memory-claude-export',):
     print('ERROR: Not a valid easy-memory-claude export bundle')
     sys.exit(1)
 
@@ -60,9 +60,12 @@ if not import_entries:
     print('Bundle is empty, nothing to import.')
     sys.exit(0)
 
+# Free bundle metadata — only entries needed
+del bundle
+
 
 def _validate_entity(entry):
-    """#30: Validate entity has required fields + correct types."""
+    """Validate entity has required fields + correct types."""
     name = entry.get('name')
     if not name or not isinstance(name, str):
         return False
@@ -75,7 +78,7 @@ def _validate_entity(entry):
 
 
 def _validate_relation(entry):
-    """#30: Validate relation has required fields."""
+    """Validate relation has required fields."""
     fr = entry.get('from')
     to = entry.get('to')
     if not fr or not isinstance(fr, str):
@@ -128,7 +131,7 @@ for entry in import_entries:
     t = entry.get('type')
 
     if t == 'entity':
-        # #30: validate structure
+        # Validate structure
         if not _validate_entity(entry):
             skipped_invalid += 1
             continue
@@ -140,7 +143,7 @@ for entry in import_entries:
             old_obs_raw = existing[idx].get(
                 'observations', []
             )
-            # P1-6: handle unhashable obs (dicts/lists)
+            # Handle unhashable obs (dicts/lists)
             old_obs_str = set()
             for o in old_obs_raw:
                 if isinstance(o, str):
@@ -165,7 +168,7 @@ for entry in import_entries:
             added_e += 1
 
     elif t == 'relation':
-        # #30: validate structure
+        # Validate structure
         if not _validate_relation(entry):
             skipped_invalid += 1
             continue
@@ -189,6 +192,8 @@ try:
             json.dumps(e, separators=(',', ':'))
             + '\n' for e in existing
         )
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, graph_path)
 except BaseException:
     try:

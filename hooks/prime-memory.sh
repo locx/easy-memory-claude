@@ -16,7 +16,10 @@ fi
 if [ -f "${HOME}/.claude/memory/maintenance.py" ]; then
     ERR_LOG="${MEMORY_DIR}/maintenance.err"
     # Rotate error log if >100KB
-    ERR_SIZE=$(wc -c < "$ERR_LOG" 2>/dev/null | tr -d ' ') || ERR_SIZE=0
+    ERR_SIZE=0
+    if [ -f "$ERR_LOG" ]; then
+        ERR_SIZE=$(wc -c < "$ERR_LOG" 2>/dev/null | tr -d ' ') || ERR_SIZE=0
+    fi
     if [ "${ERR_SIZE:-0}" -gt 100000 ] 2>/dev/null; then
         mv -f "$ERR_LOG" "${ERR_LOG}.old" 2>/dev/null || true
     fi
@@ -30,8 +33,28 @@ if [ ! -f "${MEMORY_FILE}" ] || [ ! -s "${MEMORY_FILE}" ]; then
     exit 0
 fi
 
-# Single-pass: count entities/relations and list top 30 entities
-python3 - "$MEMORY_FILE" << 'PYEOF'
+# Use cached summary if graph hasn't changed since last run
+SUMMARY_CACHE="${MEMORY_DIR}/.graph-summary.txt"
+GRAPH_MTIME=0
+CACHE_MTIME=0
+
+# Get graph mtime portably
+if [ -f "${MEMORY_FILE}" ]; then
+    GRAPH_MTIME=$(date -r "${MEMORY_FILE}" +%s 2>/dev/null \
+        || stat -c%Y "${MEMORY_FILE}" 2>/dev/null \
+        || echo 0)
+fi
+if [ -f "${SUMMARY_CACHE}" ]; then
+    CACHE_MTIME=$(date -r "${SUMMARY_CACHE}" +%s 2>/dev/null \
+        || stat -c%Y "${SUMMARY_CACHE}" 2>/dev/null \
+        || echo 0)
+fi
+
+if [ -f "${SUMMARY_CACHE}" ] && [ "${CACHE_MTIME}" -ge "${GRAPH_MTIME}" ] 2>/dev/null; then
+    cat "${SUMMARY_CACHE}"
+else
+    # Single-pass: count entities/relations and list top 30 entities
+    SUMMARY=$(python3 - "$MEMORY_FILE" << 'PYEOF'
 import sys, json
 
 graph_path = sys.argv[1]
@@ -69,6 +92,12 @@ for line in top30:
 if ec > 30:
     print(f'  ... and {ec - 30} more')
 PYEOF
+    )
+
+    echo "$SUMMARY"
+    # Cache for future sessions
+    echo "$SUMMARY" > "${SUMMARY_CACHE}" 2>/dev/null || true
+fi
 
 if [ -f "${MEMORY_DIR}/tfidf_index.json" ]; then
     echo ""
@@ -76,5 +105,5 @@ if [ -f "${MEMORY_DIR}/tfidf_index.json" ]; then
 fi
 
 echo ""
-echo "Keyword: search_nodes/open_nodes | Semantic: semantic_search_memory"
+echo "Search: semantic_search_memory | Traverse: traverse_relations | Write: create_entities"
 exit 0

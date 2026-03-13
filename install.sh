@@ -29,7 +29,7 @@
 # Per-project setup (run after install):
 #   ~/projects/easy-memory-claude/setup-project.sh /path/to/project
 #
-# Requirements: python3 3.10+, node 18+ (for npx), git
+# Requirements: python3 3.10+, git
 # Platform: macOS / Linux
 # ============================================================
 set -euo pipefail
@@ -56,8 +56,6 @@ check_cmd() {
 }
 
 check_cmd python3
-check_cmd node
-check_cmd npx
 check_cmd git
 
 PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
@@ -81,19 +79,29 @@ echo ""
 echo "[3/5] Deploying runtime scripts..."
 
 # Source files must exist from git checkout
-for pyfile in maintenance.py semantic_server.py; do
-    if [ ! -f "${SCRIPT_DIR}/${pyfile}" ]; then
-        echo "  ERROR: ${SCRIPT_DIR}/${pyfile} not found."
+for src in maintenance.py semantic_server/__init__.py; do
+    if [ ! -f "${SCRIPT_DIR}/${src}" ]; then
+        echo "  ERROR: ${SCRIPT_DIR}/${src} not found."
         echo "         Run this installer from the easy-memory-claude project directory."
         exit 1
     fi
 done
 
 cp "${SCRIPT_DIR}/maintenance.py" "${MEMORY_DIR}/maintenance.py"
-cp "${SCRIPT_DIR}/semantic_server.py" "${MEMORY_DIR}/semantic_server.py"
-chmod +x "${MEMORY_DIR}/maintenance.py" "${MEMORY_DIR}/semantic_server.py"
+chmod +x "${MEMORY_DIR}/maintenance.py"
 echo "  [ok] maintenance.py → ${MEMORY_DIR}/"
-echo "  [ok] semantic_server.py → ${MEMORY_DIR}/"
+
+# Deploy semantic_server package (directory)
+rm -rf "${MEMORY_DIR}/semantic_server"
+cp -r "${SCRIPT_DIR}/semantic_server" "${MEMORY_DIR}/semantic_server"
+# Remove __pycache__ from copied package
+find "${MEMORY_DIR}/semantic_server" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+echo "  [ok] semantic_server/ → ${MEMORY_DIR}/"
+
+# Deploy backwards-compatible shim for existing .mcp.json configs
+cp "${SCRIPT_DIR}/semantic_server.py" "${MEMORY_DIR}/semantic_server.py"
+chmod +x "${MEMORY_DIR}/semantic_server.py"
+echo "  [ok] semantic_server.py (compat shim) → ${MEMORY_DIR}/"
 printf '%s' "${SCRIPT_DIR}" > "${MEMORY_DIR}/.source-dir"
 echo "  [ok] .source-dir → ${MEMORY_DIR}/"
 echo ""
@@ -102,7 +110,7 @@ echo ""
 echo "[4/5] Deploying global hooks..."
 
 HOOK_SRC="${SCRIPT_DIR}/hooks"
-for hook in prime-memory.sh capture-decisions.sh nudge-setup.sh capture-tool-context.sh; do
+for hook in prime-memory.sh capture-decisions.sh nudge-setup.sh capture-tool-context.sh capture_tool_context.py; do
     if [ ! -f "${HOOK_SRC}/${hook}" ]; then
         echo "  ERROR: ${HOOK_SRC}/${hook} not found."
         echo "         Run this installer from the easy-memory-claude project directory."
@@ -168,7 +176,7 @@ SETEOF
     echo "  [ok] Created ${SETTINGS} with hooks"
 else
     python3 - "${SETTINGS}" << 'PYEOF'
-import json, sys, shutil
+import json, os, sys, shutil
 
 settings_path = sys.argv[1]
 
@@ -215,9 +223,20 @@ for event, new_entries in memory_hooks.items():
             changed = True
 
 if changed:
-    with open(settings_path, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=2)
-        f.write('\n')
+    tmp = settings_path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, settings_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     print(f'  [ok] Merged memory hooks into {settings_path}')
 else:
     print(f'  [skip] Memory hooks already present in {settings_path}')
