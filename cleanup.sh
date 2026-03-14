@@ -321,7 +321,7 @@ cleanup_global() {
     fi
 
     # 2. Remove hooks
-    HOOKS=(prime-memory.sh capture-decisions.sh nudge-setup.sh capture-tool-context.sh)
+    HOOKS=(prime-memory.sh capture-decisions.sh nudge-setup.sh capture-tool-context.sh capture_tool_context.py smart_recall.py)
     for hook in "${HOOKS[@]}"; do
         remove_path "${CLAUDE_HOME}/hooks/${hook}" "~/.claude/hooks/${hook}"
     done

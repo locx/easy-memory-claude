@@ -2,15 +2,20 @@
 import json
 import sys
 
+from ._json import dumps as _fast_dumps
+
 from .config import PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION
 from .graph import load_index
 from .recall import load_recall_counts
 from .search import search, search_by_time
 from .tools import (
     add_observations,
+    create_decision,
     create_entities,
     create_relations,
     delete_entities,
+    graph_stats,
+    update_decision_outcome,
 )
 from .traverse import traverse_relations
 
@@ -260,6 +265,121 @@ TOOLS = [
             "required": ["entity_names"],
         },
     },
+    {
+        "name": "create_decision",
+        "description": (
+            "Record an architectural or design decision "
+            "with structured rationale, rejected "
+            "alternatives, and outcome tracking. Use this "
+            "when the session involved choosing between "
+            "approaches, evaluating trade-offs, or making "
+            "scoping decisions."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "What was decided",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": (
+                        "Why this approach was chosen"
+                    ),
+                },
+                "alternatives": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Rejected alternatives with "
+                        "reasons (e.g. 'Vector clocks "
+                        "-- too complex for single-"
+                        "writer model')"
+                    ),
+                },
+                "scope": {
+                    "type": "string",
+                    "description": (
+                        "What code/area this affects"
+                    ),
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": [
+                        "pending", "successful",
+                        "failed", "revised",
+                        "adopted", "rejected",
+                        "deferred",
+                    ],
+                    "description": (
+                        "Current outcome status "
+                        "(default: pending)"
+                    ),
+                    "default": "pending",
+                },
+                "related_entities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Entity names to link this "
+                        "decision to via relations"
+                    ),
+                },
+            },
+            "required": ["title", "rationale"],
+        },
+    },
+    {
+        "name": "update_decision_outcome",
+        "description": (
+            "Update a decision's outcome and optionally "
+            "record a lesson learned. Use when returning "
+            "to work affected by a prior decision to "
+            "close the learning loop."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "Decision title (with or without "
+                        "'decision: ' prefix)"
+                    ),
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": [
+                        "successful", "failed", "revised",
+                        "adopted", "rejected", "deferred",
+                    ],
+                    "description": "How it turned out",
+                },
+                "lesson": {
+                    "type": "string",
+                    "description": (
+                        "What was learned from this "
+                        "decision"
+                    ),
+                },
+            },
+            "required": ["title", "outcome"],
+        },
+    },
+    {
+        "name": "graph_stats",
+        "description": (
+            "Return graph health statistics: entity/"
+            "relation counts, type breakdown, index age, "
+            "recall rankings, pending decisions, and "
+            "current session activity counters."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 
@@ -278,8 +398,11 @@ def handle_message(msg, memory_dir):
         params = {}
 
     if method == "initialize":
+        from .logging import reset_session_stats, log_event
+        reset_session_stats()
         load_index(memory_dir)
         load_recall_counts(memory_dir)
+        log_event("INIT", "session started")
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -348,6 +471,16 @@ def handle_message(msg, memory_dir):
                     args.get("entity_names", []),
                     memory_dir,
                 )
+            elif tool_name == "create_decision":
+                result = create_decision(
+                    args, memory_dir,
+                )
+            elif tool_name == "update_decision_outcome":
+                result = update_decision_outcome(
+                    args, memory_dir,
+                )
+            elif tool_name == "graph_stats":
+                result = graph_stats(memory_dir)
             else:
                 return {
                     "jsonrpc": "2.0",
@@ -360,33 +493,33 @@ def handle_message(msg, memory_dir):
                     },
                 }
         except Exception as exc:
-            sys.stderr.write(
-                f"error: {tool_name}: {exc}\n"
-            )
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "content": [{
-                        "type": "text",
-                        "text": json.dumps({
-                            "error": str(exc),
-                            "results": [],
-                        }),
-                    }],
-                },
+            exc_msg = str(exc)[:500]
+            try:
+                sys.stderr.write(
+                    f"error: {tool_name}: {exc_msg}\n"
+                )
+            except OSError:
+                pass
+            result = {
+                "error": exc_msg,
+                "results": [],
             }
 
+        try:
+            result_text = _fast_dumps(result)
+        except (TypeError, ValueError, OverflowError):
+            result_text = _fast_dumps({
+                "error": "Result not serializable",
+                "results": [],
+            })
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(result),
-                    }
-                ]
+                "content": [{
+                    "type": "text",
+                    "text": result_text,
+                }],
             },
         }
 

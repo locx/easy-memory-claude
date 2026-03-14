@@ -1,6 +1,7 @@
 """TF-IDF cosine similarity search and time-based search."""
 import heapq
 import math
+import time as _time
 from collections import Counter
 
 from .config import (
@@ -8,39 +9,32 @@ from .config import (
     MAX_QUERY_CHARS,
     MAX_TOP_K,
     RE_WORDS,
+    normalize_iso_ts as _normalize_iso_ts,
 )
+from .cache import entity_cache as _ec
 from .graph import load_index, load_graph_entities
 from .recall import maybe_reload_recall_counts, record_recalls
+from .logging import log_event, session_stats
 
 
-def _normalize_iso_ts(ts):
-    """Normalize ISO timestamp to fixed-width for safe
-    lexicographic comparison."""
-    if not ts or not isinstance(ts, str):
-        return ""
-    if (len(ts) >= 10 and ts[4] == '-' and ts[7] == '-'
-            and ts[:4].isdigit() and ts[5:7].isdigit()
-            and ts[8:10].isdigit()):
-        return ts
-    try:
-        parts = ts.split('T', 1)
-        date_parts = parts[0].split('-')
-        if len(date_parts) == 3:
-            fixed = (
-                f"{int(date_parts[0]):04d}-"
-                f"{int(date_parts[1]):02d}-"
-                f"{int(date_parts[2]):02d}"
+def _enrich_results(results, source, max_obs=5):
+    """Attach entityType + observations from source dict."""
+    for r in results:
+        info = source.get(r["entity"], {})
+        if info:
+            r["entityType"] = info.get(
+                "entityType", ""
             )
-            if len(parts) > 1:
-                return fixed + 'T' + parts[1]
-            return fixed
-    except (ValueError, IndexError):
-        pass
-    return ts
+            obs = info.get("observations")
+            r["observations"] = (
+                obs[:max_obs]
+                if isinstance(obs, list) else []
+            )
 
 
 def search(query, memory_dir, top_k=5):
     """Search memory graph using TF-IDF cosine similarity."""
+    _t0 = _time.monotonic()
     if not isinstance(query, str):
         query = str(query) if query is not None else ""
     if len(query) > MAX_QUERY_CHARS:
@@ -93,7 +87,12 @@ def search(query, memory_dir, top_k=5):
         sum(v * v for v in query_vec.values())
     )
     if mag_q == 0:
-        return {"results": [], "total_indexed": len(vectors)}
+        return {
+            "results": [],
+            "total_indexed": len(vectors),
+            "note": "All query terms are too common "
+                    "or not in index",
+        }
 
     query_keys = query_vec.keys()
 
@@ -168,31 +167,25 @@ def search(query, memory_dir, top_k=5):
     ]
 
     if results:
-        if metadata:
-            for r in results:
-                info = metadata.get(r["entity"], {})
-                if info:
-                    r["entityType"] = info.get(
-                        "entityType", ""
-                    )
-                    r["observations"] = info.get(
-                        "observations", []
-                    )[:5]
+        # Prefer entity cache → index metadata → graph load
+        if _ec["data"] is not None:
+            source = _ec["data"]
+        elif isinstance(metadata, dict) and metadata:
+            source = metadata
         else:
-            entities = load_graph_entities(memory_dir)
-            for r in results:
-                info = entities.get(r["entity"], {})
-                if info:
-                    r["entityType"] = info.get(
-                        "entityType", ""
-                    )
-                    r["observations"] = info.get(
-                        "observations", []
-                    )[:5]
+            source = load_graph_entities(memory_dir)
+        _enrich_results(results, source)
 
     if results:
         record_recalls([r["entity"] for r in results])
 
+    session_stats["searches"] += 1
+    _elapsed = int((_time.monotonic() - _t0) * 1000)
+    log_event(
+        "SEARCH",
+        f'query="{query[:60]}" results='
+        f'{len(results)} latency={_elapsed}ms',
+    )
     return {"results": results, "total_indexed": len(vectors)}
 
 
@@ -207,10 +200,13 @@ def search_by_time(memory_dir, since=None, until=None,
         limit = 20
     entities = load_graph_entities(memory_dir)
 
+    # Normalize only the query bounds — entity timestamps
+    # are pre-normalized during graph parse (_norm_ts).
     since_n = _normalize_iso_ts(since) if since else None
     until_n = _normalize_iso_ts(until) if until else None
 
-    # Pass 1: collect (ts_normalized, name, raw_ts) tuples
+    # Pass 1: collect (ts, name) tuples — timestamps
+    # are already normalized from parse, skip per-entity call.
     candidates = []
     for name, info in entities.items():
         ts = info.get("_updated") or info.get(
@@ -218,12 +214,11 @@ def search_by_time(memory_dir, since=None, until=None,
         )
         if not ts:
             continue
-        ts_n = _normalize_iso_ts(ts)
-        if since_n and ts_n < since_n:
+        if since_n and ts < since_n:
             continue
-        if until_n and ts_n > until_n:
+        if until_n and ts > until_n:
             continue
-        candidates.append((ts_n, name, ts))
+        candidates.append((ts, name))
 
     total_matched = len(candidates)
 
@@ -232,18 +227,25 @@ def search_by_time(memory_dir, since=None, until=None,
 
     # Pass 3: build result dicts only for winners
     results = []
-    for _ts_n, name, ts in top:
+    for ts, name in top:
         info = entities.get(name, {})
+        obs = info.get("observations")
         results.append({
             "entity": name,
             "entityType": info.get("entityType", ""),
             "updated": ts,
             "created": info.get("_created", ""),
-            "observations": info.get(
-                "observations", []
-            )[:3],
+            "observations": (
+                obs[:3] if isinstance(obs, list) else []
+            ),
         })
 
+    session_stats["searches"] += 1
+    log_event(
+        "TIME_SEARCH",
+        f"since={since} until={until} "
+        f"matched={total_matched}",
+    )
     return {
         "results": results,
         "total_matched": total_matched,

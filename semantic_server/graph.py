@@ -11,6 +11,9 @@ import os
 import sys
 import time
 
+from ._json import loads as _fast_loads
+from ._json import dumps as _fast_dumps
+
 try:
     import fcntl
 except ImportError:
@@ -22,8 +25,8 @@ from .config import (
     MAX_INPUT_CHARS,
     MAX_CACHED_OBS,
     GRAPH_LOCK_TIMEOUT,
-    GRAPH_LOCK_RETRIES,
     PARSE_TIME_BUDGET,
+    normalize_iso_ts as _norm_ts,
 )
 from .cache import (
     index_cache,
@@ -75,6 +78,10 @@ def _parse_graph_file(graph_path, start_offset=0):
     deadline = time.monotonic() + PARSE_TIME_BUDGET
     line_count = 0
     end_offset = start_offset
+    # Byte guard for incremental reads — cap at 2x
+    # typical append batch to catch corruption/runaway.
+    max_incr_bytes = MAX_GRAPH_BYTES if start_offset == 0 \
+        else min(MAX_GRAPH_BYTES, 10_000_000)
     try:
         # Binary mode for correct byte-offset tracking
         # (text-mode seek is undefined for non-tell values)
@@ -83,6 +90,14 @@ def _parse_graph_file(graph_path, start_offset=0):
                 f.seek(start_offset)
             for raw in f:
                 end_offset = f.tell()
+                # Byte budget guard for incremental reads
+                if (end_offset - start_offset
+                        > max_incr_bytes):
+                    sys.stderr.write(
+                        "warn: incremental read byte "
+                        "budget exceeded\n"
+                    )
+                    break
                 line = raw.decode("utf-8", errors="replace")
                 if len(line) > MAX_INPUT_CHARS:
                     continue
@@ -100,12 +115,14 @@ def _parse_graph_file(graph_path, start_offset=0):
                         )
                         break
                 try:
-                    obj = json.loads(line)
+                    obj = _fast_loads(line)
                     if not isinstance(obj, dict):
                         continue
                     t = obj.get("type")
                     if t == "entity":
                         name = obj.get("name", "")
+                        if isinstance(name, str):
+                            name = name.strip()
                         if not name:
                             continue
                         # Cap entity count to bound memory
@@ -114,9 +131,13 @@ def _parse_graph_file(graph_path, start_offset=0):
                                 >= MAX_ENTITY_COUNT):
                             continue
                         obs = obj.get("observations", [])
+                        if not isinstance(obs, list):
+                            obs = []
                         if name in entities:
                             prev = entities[name]
-                            prev_obs = prev["observations"]
+                            prev_obs = prev.get(
+                                "observations", []
+                            )
                             seen = prev.get("_obs_keys")
                             if seen is None:
                                 seen = set()
@@ -144,13 +165,17 @@ def _parse_graph_file(graph_path, start_offset=0):
                                     _obs_dedup_key(o)
                                     for o in kept
                                 }
-                            new_c = obj.get("_created", "")
+                            new_c = _norm_ts(
+                                obj.get("_created", "")
+                            )
                             if new_c and (
                                 not prev["_created"]
                                 or new_c < prev["_created"]
                             ):
                                 prev["_created"] = new_c
-                            new_u = obj.get("_updated", "")
+                            new_u = _norm_ts(
+                                obj.get("_updated", "")
+                            )
                             if new_u and (
                                 not prev["_updated"]
                                 or new_u > prev["_updated"]
@@ -171,11 +196,11 @@ def _parse_graph_file(graph_path, start_offset=0):
                                     "entityType", ""
                                 ),
                                 "observations": obs_list,
-                                "_created": obj.get(
-                                    "_created", ""
+                                "_created": _norm_ts(
+                                    obj.get("_created", "")
                                 ),
-                                "_updated": obj.get(
-                                    "_updated", ""
+                                "_updated": _norm_ts(
+                                    obj.get("_updated", "")
                                 ),
                             }
                             branch = obj.get("_branch")
@@ -194,7 +219,7 @@ def _parse_graph_file(graph_path, start_offset=0):
                                 "relationType", ""
                             ),
                         })
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError):
                     continue
     except OSError:
         return None, None, 0
@@ -245,8 +270,9 @@ def load_index(memory_dir):
         return index_cache["data"]
 
     try:
+        from ._json import load as _fast_load
         with open(index_path, encoding="utf-8") as f:
-            data = json.load(f)
+            data = _fast_load(f)
         size = estimate_size(data.get("vectors", {}))
         index_cache["data"] = data
         index_cache["mtime"] = mtime
@@ -254,7 +280,7 @@ def load_index(memory_dir):
         index_cache["size"] = size
         maybe_evict_caches()
         return data
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, ValueError, OSError):
         clear_index_cache()
         return None
 
@@ -286,7 +312,10 @@ def load_graph_entities(memory_dir):
         new_ents, new_rels, offset = _parse_graph_file(
             graph_path, start_offset=prev_offset
         )
-        if new_ents is not None:
+        if new_ents is None:
+            # Incremental read failed — force full parse
+            entity_cache["append_only"] = False
+        else:
             # Merge new into existing cache
             existing = entity_cache["data"]
             for name, info in new_ents.items():
@@ -318,12 +347,18 @@ def load_graph_entities(memory_dir):
             # Merge new relations
             if relation_cache["data"] is not None:
                 relation_cache["data"].extend(new_rels)
-                relation_cache["size"] = estimate_size(
-                    relation_cache["data"]
+                # Incremental size: add delta, not re-scan
+                relation_cache["size"] += (
+                    estimate_size(new_rels)
+                    if new_rels else 0
                 )
             entity_cache["mtime"] = mtime
             entity_cache["offset"] = offset
-            entity_cache["size"] = estimate_size(existing)
+            # Incremental size: add delta for new entities
+            entity_cache["size"] += (
+                estimate_size(new_ents)
+                if new_ents else 0
+            )
             entity_cache["append_only"] = False
             # Invalidate adjacency (relations changed)
             adjacency_cache.update(
@@ -379,8 +414,14 @@ class GraphLock:
             return self
         try:
             self._fd = open(self._path, "a")
-            # Retry with timeout instead of blocking
-            for _ in range(GRAPH_LOCK_RETRIES):
+        except OSError:
+            return self
+        try:
+            # Exponential backoff with monotonic deadline
+            # to avoid float accumulation drift.
+            delay = 0.01
+            deadline = time.monotonic() + GRAPH_LOCK_TIMEOUT
+            while time.monotonic() < deadline:
                 try:
                     fcntl.flock(
                         self._fd,
@@ -389,21 +430,21 @@ class GraphLock:
                     self.acquired = True
                     return self
                 except (IOError, OSError):
-                    time.sleep(
-                        GRAPH_LOCK_TIMEOUT
-                        / GRAPH_LOCK_RETRIES
-                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.5)
             # Timeout — lock not acquired
             sys.stderr.write(
                 "warn: graph lock timeout after "
                 f"{GRAPH_LOCK_TIMEOUT}s\n"
             )
+        except Exception:
+            # Ensure fd cleanup on unexpected exception
             self._fd.close()
             self._fd = None
-        except OSError:
-            if self._fd is not None:
-                self._fd.close()
-                self._fd = None
+            raise
+        # Timeout path — close fd, no lock acquired
+        self._fd.close()
+        self._fd = None
         return self
 
     def __exit__(self, *exc):
@@ -472,16 +513,22 @@ def append_jsonl(memory_dir, entries, do_fsync=True):
     lock.
     """
     graph_path = os.path.join(memory_dir, "graph.jsonl")
-    # Batch into single write + single fsync
-    data = "".join(
-        json.dumps(e, separators=(",", ":")) + "\n"
-        for e in entries
-    )
     with GraphLock(memory_dir) as lock:
         if not lock.acquired:
             return False
+        # Pre-serialize outside file write to catch
+        # serialization errors before touching the file.
+        # Avoids partial writes from generator failures.
+        lines = []
+        for e in entries:
+            try:
+                lines.append(_fast_dumps(e) + "\n")
+            except (TypeError, ValueError, OverflowError):
+                continue  # skip unserializable entries
+        if not lines:
+            return True
         with open(graph_path, "a", encoding="utf-8") as f:
-            f.write(data)
+            f.writelines(lines)
             f.flush()
             if do_fsync:
                 os.fsync(f.fileno())
@@ -499,26 +546,50 @@ def rewrite_graph(memory_dir, entities_dict, relations):
     """
     graph_path = os.path.join(memory_dir, "graph.jsonl")
     tmp = graph_path + ".new"
-    sep = (",", ":")
 
     def _lines():
         for name, info in entities_dict.items():
+            if not name or not isinstance(name, str):
+                continue
             entry = {"type": "entity", "name": name}
             entry.update(info)
-            yield json.dumps(entry, separators=sep) + "\n"
+            try:
+                yield _fast_dumps(entry) + "\n"
+            except (TypeError, ValueError, OverflowError):
+                continue
         for r in relations:
+            if not r.get("from") or not r.get("to"):
+                continue
             entry = {"type": "relation"}
             entry.update(r)
-            yield json.dumps(entry, separators=sep) + "\n"
+            try:
+                yield _fast_dumps(entry) + "\n"
+            except (TypeError, ValueError, OverflowError):
+                continue
 
+    # Write temp file OUTSIDE lock — reduces lock hold
+    # time from seconds to milliseconds (just the rename).
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(_lines())
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    # Lock only for the atomic rename
     with GraphLock(memory_dir) as lock:
         if not lock.acquired:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             raise OSError("Graph lock timeout")
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.writelines(_lines())
-                f.flush()
-                os.fsync(f.fileno())
             os.replace(tmp, graph_path)
         except BaseException:
             try:

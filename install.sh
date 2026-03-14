@@ -104,6 +104,29 @@ chmod +x "${MEMORY_DIR}/semantic_server.py"
 echo "  [ok] semantic_server.py (compat shim) → ${MEMORY_DIR}/"
 printf '%s' "${SCRIPT_DIR}" > "${MEMORY_DIR}/.source-dir"
 echo "  [ok] .source-dir → ${MEMORY_DIR}/"
+
+# Optional: orjson for 3-10x faster graph I/O
+if python3 -c "import orjson" 2>/dev/null; then
+    echo "  [ok] orjson already installed"
+else
+    echo ""
+    echo "  orjson is an optional dependency that speeds up graph I/O by 3-10x."
+    echo "  The server works fine without it (falls back to stdlib json)."
+    printf "  Install orjson now? [y/N] "
+    read -r ans
+    case "$ans" in
+        [yY]|[yY][eE][sS])
+            if python3 -m pip install --user --quiet "orjson>=3.9" 2>/dev/null; then
+                echo "  [ok] orjson installed"
+            else
+                echo "  [skip] pip install failed — continuing with stdlib json"
+            fi
+            ;;
+        *)
+            echo "  [skip] orjson — using stdlib json"
+            ;;
+    esac
+fi
 echo ""
 
 # --- Deploy hooks ---

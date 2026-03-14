@@ -35,13 +35,13 @@ if [ -f "$MARKER" ]; then
     fi
 fi
 # Save stdin to temp file (capped at 50KB), pass path to Python
-TMPINPUT=$(mktemp /tmp/.claude-toolcap-XXXXXX)
+TMPINPUT=$(mktemp /tmp/.claude-toolcap-XXXXXX) || exit 1
 chmod 600 "$TMPINPUT"
 trap 'rm -f "$TMPINPUT" 2>/dev/null' EXIT
 head -c 51200 > "$TMPINPUT"
 
 # Use standalone .py for bytecode caching (.pyc)
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || exit 1
 python3 "${SCRIPT_DIR}/capture_tool_context.py" "$TMPINPUT" "$GRAPH"
 PY_EXIT=$?
 

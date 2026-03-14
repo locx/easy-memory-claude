@@ -1,10 +1,20 @@
 """BFS relation traversal over the knowledge graph."""
+import os
+
 from .cache import (
     adjacency_cache,
     estimate_size,
     maybe_evict_caches,
 )
-from .graph import load_graph_entities, load_graph_relations
+from .graph import (
+    get_graph_mtime,
+    load_graph_entities,
+    load_graph_relations,
+)
+
+# Hard cap on traversal result size to prevent OOM
+# on dense graphs. 10K nodes is ~40MB worst case.
+_MAX_VISITED = 10_000
 
 
 def _get_adjacency(memory_dir):
@@ -23,43 +33,71 @@ def _get_adjacency(memory_dir):
     outbound = {}
     inbound = {}
     for r in relations:
-        fr, to = r["from"], r["to"]
-        rt = r["relationType"]
+        fr = r.get("from", "")
+        to = r.get("to", "")
+        rt = r.get("relationType", "")
+        if not fr or not to:
+            continue
         outbound.setdefault(fr, []).append((to, rt))
         inbound.setdefault(to, []).append((fr, rt))
 
     adjacency_cache["outbound"] = outbound
     adjacency_cache["inbound"] = inbound
     adjacency_cache["mtime"] = mtime
-    # Track adjacency size for eviction
     adjacency_cache["size"] = (
-        estimate_size(outbound) + estimate_size(inbound)
+        estimate_size(outbound)
+        + estimate_size(inbound)
     )
     maybe_evict_caches()
     return outbound, inbound
 
 
-def traverse_relations(entity, memory_dir, direction="both",
+def traverse_relations(entity, memory_dir,
+                       direction="both",
                        max_depth=2):
-    """BFS traversal over relations from a start entity."""
+    """BFS traversal with visited-set cap."""
+    if isinstance(max_depth, bool):
+        max_depth = 2
     try:
         max_depth = min(max(int(max_depth), 1), 5)
     except (ValueError, TypeError):
         max_depth = 2
-    if direction not in ("outbound", "inbound", "both"):
+    if direction not in (
+        "outbound", "inbound", "both"
+    ):
         direction = "both"
 
+    # Quick file check before triggering a full parse
+    _, mtime = get_graph_mtime(memory_dir)
+    if mtime is None:
+        return {
+            "error": "Graph file not found",
+            "nodes": [],
+            "edges": [],
+        }
+
     entities = load_graph_entities(memory_dir)
+    if not entities:
+        return {
+            "error": "Graph is empty or unreadable",
+            "nodes": [],
+            "edges": [],
+        }
+
     outbound, inbound = _get_adjacency(memory_dir)
 
     if entity not in entities:
-        return {"error": f"Entity '{entity}' not found",
-                "nodes": [], "edges": []}
+        return {
+            "error": f"Entity '{entity}' not found",
+            "nodes": [],
+            "edges": [],
+        }
 
     visited = {entity}
     frontier = [entity]
     seen_edges = set()
     edges = []
+    capped = False
 
     for _depth in range(max_depth):
         next_frontier = []
@@ -82,21 +120,29 @@ def traverse_relations(entity, memory_dir, direction="both",
                     "relationType": rt,
                 })
                 if target not in visited:
+                    if len(visited) >= _MAX_VISITED:
+                        capped = True
+                        continue
                     visited.add(target)
                     next_frontier.append(target)
         frontier = next_frontier
-        if not frontier:
+        if not frontier or capped:
             break
 
     nodes = []
     for name in visited:
         info = entities.get(name, {})
+        obs = info.get("observations", [])
         nodes.append({
             "name": name,
-            "entityType": info.get("entityType", ""),
-            "observations": info.get(
-                "observations", []
-            )[:3],
+            "entityType": info.get(
+                "entityType", ""
+            ),
+            "observations": obs[:3],
         })
 
-    return {"nodes": nodes, "edges": edges}
+    result = {"nodes": nodes, "edges": edges}
+    if capped:
+        result["truncated"] = True
+        result["max_visited"] = _MAX_VISITED
+    return result

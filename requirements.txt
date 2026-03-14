@@ -1,4 +1,3 @@
-# Memory tools — all pure Python, zero mandatory deps
 # Optional: uncomment for neural embeddings upgrade
 # numpy>=1.24
 # sentence-transformers>=2.2

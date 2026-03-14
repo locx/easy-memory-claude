@@ -1,4 +1,13 @@
-"""Write operations: create, update, delete entities and relations."""
+"""Write operations + intelligence tools.
+
+Includes: create, update, delete entities/relations,
+create_decision, update_decision_outcome, graph_stats.
+"""
+import os
+import sys
+import time
+from collections import Counter
+
 from .config import (
     MAX_ENTITIES_PER_CALL,
     MAX_GRAPH_BYTES,
@@ -18,16 +27,18 @@ from .graph import (
     load_graph_relations,
     rewrite_graph,
 )
-from .cache import entity_cache
+from .cache import entity_cache, relation_cache
+from .logging import log_event, session_stats
+
+_DECISION_PREFIX = "decision: "
+_DECISION_PREFIX_LEN = len(_DECISION_PREFIX)
 
 
 def create_entities(entities_input, memory_dir):
-    """Create or merge entities into the graph.
+    """Create entities via append-only write.
 
-    If an entity with same name exists, a duplicate entry
-    with merged observations is appended (O(1)). Maintenance
-    consolidation deduplicates on next run. This avoids O(n)
-    full graph rewrite on every merge call.
+    Returns error dict on lock timeout instead of
+    silently losing data.
     """
     if not isinstance(entities_input, list):
         return {"error": "entities must be a list"}
@@ -41,18 +52,16 @@ def create_entities(entities_input, memory_dir):
         return size_err
 
     now = now_iso()
-    # Skip full graph load on cold cache —
-    # append unconditionally, let maintenance dedup.
-    cache_warm = entity_cache["data"] is not None
-    existing = load_graph_entities(memory_dir) \
-        if cache_warm else {}
     new_entries = []
 
     for ent in entities_input:
         if not isinstance(ent, dict):
             continue
         name = ent.get("name", "")
-        if not name or not isinstance(name, str):
+        if not isinstance(name, str):
+            continue
+        name = name.strip()
+        if not name:
             continue
         etype = ent.get("entityType", "")
         if not isinstance(etype, str):
@@ -65,55 +74,42 @@ def create_entities(entities_input, memory_dir):
             if isinstance(o, str) and o.strip()
         ]
 
-        if cache_warm and name in existing:
-            # Merge: deduplicate new obs, append entity
-            # line. Maintenance consolidation merges later.
-            cur = existing[name]
-            cur_obs_list = cur.get("observations", [])
-            cur_obs_keys = {
-                _obs_dedup_key(o) for o in cur_obs_list
-            }
-            new_obs = []
-            for o in obs:
-                k = _obs_dedup_key(o)
-                if k not in cur_obs_keys:
-                    new_obs.append(o)
-                    cur_obs_keys.add(k)
-            merged = list(cur_obs_list) + new_obs
-            new_entries.append({
-                "type": "entity",
-                "name": name,
-                "entityType": cur.get(
-                    "entityType", etype
-                ),
-                "observations": merged,
-                "_created": cur.get("_created", now),
-                "_updated": now,
-            })
-        else:
-            new_entries.append({
-                "type": "entity",
-                "name": name,
-                "entityType": etype,
-                "observations": obs,
-                "_created": now,
-                "_updated": now,
-            })
+        new_entries.append({
+            "type": "entity",
+            "name": name,
+            "entityType": etype,
+            "observations": obs,
+            "_created": now,
+            "_updated": now,
+        })
 
     if not new_entries:
-        return {"created": 0, "message": "No valid entities"}
+        return {
+            "created": 0,
+            "message": "No valid entities",
+        }
 
-    # Append-only for all cases (new + merge).
-    # Duplicate names from merges are resolved by
-    # _parse_graph_file() on next cache load and by
-    # maintenance consolidation on next run.
-    append_jsonl(memory_dir, new_entries)
+    if not append_jsonl(memory_dir, new_entries):
+        return {
+            "error": "Write failed (lock timeout)",
+            "created": 0,
+        }
     invalidate_entity_cache_only()
+
+    names = [e["name"] for e in new_entries]
+    session_stats["entities_created"] += len(new_entries)
+    log_event(
+        "CREATE",
+        f"{len(new_entries)} entities: {names}",
+    )
     return {"created": len(new_entries)}
 
 
 def create_relations(relations_input, memory_dir):
-    """Create relations, skipping duplicates."""
+    """Create relations via append-only write.
+
+    Returns error on lock timeout.
+    """
     if not isinstance(relations_input, list):
         return {"error": "relations must be a list"}
     if len(relations_input) > MAX_RELATIONS_PER_CALL:
@@ -125,11 +121,7 @@ def create_relations(relations_input, memory_dir):
     if size_err:
         return size_err
 
-    existing_rels = load_graph_relations(memory_dir)
-    seen = {
-        (r["from"], r["to"], r.get("relationType", ""))
-        for r in existing_rels
-    }
+    seen = set()
     new_entries = []
     for rel in relations_input:
         if not isinstance(rel, dict):
@@ -137,7 +129,8 @@ def create_relations(relations_input, memory_dir):
         fr = rel.get("from", "")
         to = rel.get("to", "")
         rt = rel.get("relationType", "")
-        if not fr or not to or not isinstance(fr, str) \
+        if not fr or not to \
+                or not isinstance(fr, str) \
                 or not isinstance(to, str):
             continue
         if fr == to:
@@ -156,18 +149,35 @@ def create_relations(relations_input, memory_dir):
     if not new_entries:
         return {
             "created": 0,
-            "message": "No new relations (all duplicates "
-                       "or invalid)",
+            "message": "No new relations",
         }
 
-    append_jsonl(memory_dir, new_entries)
+    if not append_jsonl(memory_dir, new_entries):
+        return {
+            "error": "Write failed (lock timeout)",
+            "created": 0,
+        }
     invalidate_relation_cache_only()
+
+    session_stats["relations_created"] += len(new_entries)
+    descs = [
+        f"{e['from']}--{e['relationType']}-->"
+        f"{e['to']}"
+        for e in new_entries[:5]
+    ]
+    log_event(
+        "RELATE",
+        f"{len(new_entries)} relations: "
+        + ", ".join(descs),
+    )
     return {"created": len(new_entries)}
 
 
-def add_observations(entity_name, observations, memory_dir):
+def add_observations(entity_name, observations,
+                     memory_dir):
     """Add observations to an existing entity."""
-    if not isinstance(entity_name, str) or not entity_name:
+    if not isinstance(entity_name, str) \
+            or not entity_name:
         return {"error": "entity name required"}
     if not isinstance(observations, list):
         return {"error": "observations must be a list"}
@@ -180,51 +190,73 @@ def add_observations(entity_name, observations, memory_dir):
     if size_err:
         return size_err
 
-    entities = load_graph_entities(memory_dir)
-    if entity_name not in entities:
-        return {
-            "error": f"Entity '{entity_name}' not found"
-        }
-
-    now = now_iso()
-    info = entities[entity_name]
-    cur_obs_list = info.get("observations", [])
-    cur_obs_keys = {
-        _obs_dedup_key(o) for o in cur_obs_list
-    }
-    new_obs = []
-    for o in observations:
-        if not isinstance(o, str) or not o.strip():
-            continue
-        o = o[:MAX_OBS_LENGTH]
-        if o not in cur_obs_keys:
-            new_obs.append(o)
-            cur_obs_keys.add(o)
-
+    new_obs = [
+        o[:MAX_OBS_LENGTH] for o in observations
+        if isinstance(o, str) and o.strip()
+    ]
     if not new_obs:
         return {
             "added": 0,
-            "message": "All observations already exist",
+            "message": "No valid observations",
         }
 
-    # Append-only: write a duplicate entity line with
-    # just the new observations. Maintenance consolidation
-    # merges duplicates on next run. Avoids O(n) full
-    # graph rewrite for each add_observations call.
-    append_jsonl(memory_dir, [{
+    now = now_iso()
+
+    # Load entities to verify existence and dedup.
+    # Always load — cold cache previously caused blind
+    # appends to non-existent entities (ghost writes).
+    cached = entity_cache["data"]
+    if cached is None:
+        cached = load_graph_entities(memory_dir)
+    if entity_name not in cached:
+        return {
+            "error": (
+                f"Entity '{entity_name}' not found"
+            ),
+        }
+    info = cached[entity_name]
+    cur_obs_keys = {
+        _obs_dedup_key(o)
+        for o in info.get("observations", [])
+    }
+    new_obs = [
+        o for o in new_obs
+        if _obs_dedup_key(o) not in cur_obs_keys
+    ]
+    if not new_obs:
+        return {
+            "added": 0,
+            "message": "All observations "
+                       "already exist",
+        }
+    etype = info.get("entityType", "")
+    created = info.get("_created", now)
+
+    if not append_jsonl(memory_dir, [{
         "type": "entity",
         "name": entity_name,
-        "entityType": info.get("entityType", ""),
+        "entityType": etype,
         "observations": new_obs,
-        "_created": info.get("_created", now),
+        "_created": created,
         "_updated": now,
-    }])
+    }]):
+        return {
+            "error": "Write failed (lock timeout)",
+            "added": 0,
+        }
     invalidate_entity_cache_only()
-    return {"added": len(new_obs)}
+
+    total = len(new_obs)
+    session_stats["observations_added"] += total
+    log_event(
+        "ADD_OBS",
+        f'entity="{entity_name}" added={total}',
+    )
+    return {"added": total}
 
 
 def delete_entities(entity_names, memory_dir):
-    """Delete entities and cascade-remove their relations."""
+    """Delete entities and cascade-remove relations."""
     if not isinstance(entity_names, list):
         return {"error": "entity_names must be a list"}
 
@@ -239,8 +271,6 @@ def delete_entities(entity_names, memory_dir):
             "message": "No matching entities found",
         }
 
-    # Build a copy — never mutate cached dict before
-    # disk write succeeds
     remaining = {
         k: v for k, v in entities.items()
         if k not in to_delete
@@ -249,13 +279,270 @@ def delete_entities(entity_names, memory_dir):
     rels = load_graph_relations(memory_dir)
     kept_rels = [
         r for r in rels
-        if r["from"] not in to_delete
-        and r["to"] not in to_delete
+        if r.get("from") not in to_delete
+        and r.get("to") not in to_delete
     ]
 
     rewrite_graph(memory_dir, remaining, kept_rels)
     invalidate_caches()
+
+    n_del = len(to_delete)
+    n_rels = len(rels) - len(kept_rels)
+    session_stats["entities_deleted"] += n_del
+    log_event(
+        "DELETE",
+        f"{n_del} entities: {list(to_delete)[:5]}"
+        f", {n_rels} relations cascaded",
+    )
     return {
-        "deleted": len(to_delete),
-        "relations_removed": len(rels) - len(kept_rels),
+        "deleted": n_del,
+        "relations_removed": n_rels,
     }
+
+
+# --- Intelligence tools ---
+
+
+def create_decision(args, memory_dir):
+    """Create a structured decision entity.
+
+    Wraps create_entities with decision-specific schema:
+    title, rationale, alternatives, scope, outcome.
+    Auto-creates relations to related_entities.
+    """
+    if not isinstance(args, dict):
+        return {"error": "arguments must be a dict"}
+
+    title = args.get("title", "")
+    if not title or not isinstance(title, str):
+        return {"error": "title is required"}
+
+    rationale = args.get("rationale", "")
+    if not rationale or not isinstance(rationale, str):
+        return {"error": "rationale is required"}
+
+    obs = [f"Rationale: {rationale[:MAX_OBS_LENGTH]}"]
+
+    alternatives = args.get("alternatives", [])
+    if isinstance(alternatives, list):
+        for alt in alternatives[:10]:
+            if isinstance(alt, str) and alt.strip():
+                obs.append(
+                    f"Alternative rejected: "
+                    f"{alt[:MAX_OBS_LENGTH]}"
+                )
+
+    scope = args.get("scope", "")
+    if isinstance(scope, str) and scope.strip():
+        obs.append(
+            f"Scope: {scope[:MAX_OBS_LENGTH]}"
+        )
+
+    outcome = args.get("outcome", "pending")
+    if outcome not in (
+        "pending", "successful", "failed", "revised",
+        "adopted", "rejected", "deferred",
+    ):
+        outcome = "pending"
+    obs.append(f"Outcome: {outcome}")
+
+    entity_name = f"{_DECISION_PREFIX}{title}"
+    result = create_entities(
+        [{
+            "name": entity_name,
+            "entityType": "decision",
+            "observations": obs,
+        }],
+        memory_dir,
+    )
+
+    related = args.get("related_entities", [])
+    if isinstance(related, list) and related:
+        rel_entries = []
+        for target in related[:10]:
+            if isinstance(target, str) \
+                    and target.strip():
+                rel_entries.append({
+                    "from": entity_name,
+                    "to": target,
+                    "relationType": "decided-for",
+                })
+        if rel_entries:
+            create_relations(rel_entries, memory_dir)
+
+    log_event(
+        "DECISION",
+        f'"{title}" outcome={outcome}',
+    )
+    return {
+        "created": result.get("created", 0),
+        "decision": entity_name,
+        "outcome": outcome,
+    }
+
+
+def update_decision_outcome(args, memory_dir):
+    """Update a decision's outcome and record lesson.
+
+    Tries both with and without 'decision: ' prefix
+    to find the entity.
+    """
+    if not isinstance(args, dict):
+        return {"error": "arguments must be a dict"}
+
+    title = args.get("title", "")
+    if not title or not isinstance(title, str):
+        return {"error": "title is required"}
+
+    outcome = args.get("outcome", "")
+    _valid_outcomes = (
+        "successful", "failed", "revised",
+        "adopted", "rejected", "deferred",
+    )
+    if outcome not in _valid_outcomes:
+        return {
+            "error": "outcome must be one of: "
+                     + ", ".join(_valid_outcomes)
+        }
+
+    lesson = args.get("lesson", "")
+
+    # Try both prefixed and unprefixed names
+    if title.startswith(_DECISION_PREFIX):
+        candidates = [title]
+    else:
+        candidates = [
+            f"{_DECISION_PREFIX}{title}",
+            title,
+        ]
+
+    new_obs = [f"Outcome: {outcome}"]
+    if isinstance(lesson, str) and lesson.strip():
+        new_obs.append(
+            f"Lesson: {lesson[:MAX_OBS_LENGTH]}"
+        )
+
+    # Try each candidate name
+    for entity_name in candidates:
+        result = add_observations(
+            entity_name, new_obs, memory_dir
+        )
+        if "error" not in result:
+            log_event(
+                "OUTCOME",
+                f'"{title}" -> {outcome}'
+                + (f" lesson: {lesson[:80]}"
+                   if lesson else ""),
+            )
+            return {
+                "updated": entity_name,
+                "outcome": outcome,
+                "observations_added": result.get(
+                    "added", 0
+                ),
+            }
+
+    return {
+        "error": f"Decision '{title}' not found",
+    }
+
+
+def graph_stats(memory_dir):
+    """Return graph health and session stats."""
+    entities = load_graph_entities(memory_dir)
+    relations = load_graph_relations(memory_dir)
+
+    type_counts = Counter(
+        info.get("entityType", "unknown")
+        for info in entities.values()
+    )
+
+    graph_path = os.path.join(
+        memory_dir, "graph.jsonl"
+    )
+    graph_kb = 0
+    try:
+        graph_kb = os.path.getsize(graph_path) // 1024
+    except OSError:
+        pass
+
+    index_path = os.path.join(
+        memory_dir, "tfidf_index.json"
+    )
+    index_age = "not built"
+    index_kb = 0
+    try:
+        mtime = os.path.getmtime(index_path)
+        index_age = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(mtime),
+        )
+        index_kb = os.path.getsize(index_path) // 1024
+    except OSError:
+        pass
+
+    marker = os.path.join(
+        memory_dir, ".last-maintenance"
+    )
+    last_maint = "never"
+    try:
+        mtime = os.path.getmtime(marker)
+        last_maint = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(mtime),
+        )
+    except OSError:
+        pass
+
+    try:
+        from .recall import recall_counts as _rc
+        top_recall = sorted(
+            (
+                (n, c) for n, c in _rc.items()
+                if isinstance(c, (int, float))
+            ),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:10]
+    except Exception:
+        top_recall = []
+
+    n_pending = 0
+    for name, info in entities.items():
+        if info.get("entityType") != "decision":
+            continue
+        obs = info.get("observations", [])
+        has_final = any(
+            isinstance(o, str)
+            and o.startswith("Outcome: ")
+            and not o.startswith("Outcome: pending")
+            for o in obs
+        )
+        if not has_final:
+            n_pending += 1
+
+    result = {
+        "entities": len(entities),
+        "relations": len(relations),
+        "graph_size_kb": graph_kb,
+        "index_size_kb": index_kb,
+        "index_built": index_age,
+        "last_maintenance": last_maint,
+        "type_breakdown": dict(
+            type_counts.most_common(20)
+        ),
+        "top_by_recall": [
+            {"name": n, "recalls": c}
+            for n, c in top_recall
+        ],
+        "pending_decisions": n_pending,
+        "session": dict(session_stats),
+    }
+
+    log_event(
+        "STATS",
+        f"{len(entities)} entities, "
+        f"{len(relations)} relations, "
+        f"{n_pending} pending decisions",
+    )
+    return result

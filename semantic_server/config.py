@@ -4,7 +4,7 @@ import time
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memory-semantic-search"
-SERVER_VERSION = "2.3.0"
+SERVER_VERSION = "3.0.0"
 
 MAX_INPUT_CHARS = 10_000_000  # 10 MB — reject oversized lines
 MAX_TOP_K = 100               # cap result count
@@ -35,3 +35,38 @@ RE_WORDS = re.compile(r'\w+')
 def now_iso():
     """Current UTC timestamp in ISO format."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def normalize_iso_ts(ts):
+    """Normalize ISO timestamp for safe lexicographic sort.
+
+    Canonical implementation — imported by graph.py and
+    search.py. Fast path for well-formed timestamps
+    (>99% case).
+    """
+    if not ts or not isinstance(ts, str):
+        return ""
+    if (len(ts) >= 10 and ts[4] == '-' and ts[7] == '-'
+            and ts[:4].isdigit() and ts[5:7].isdigit()
+            and ts[8:10].isdigit()):
+        # Validate month (01-12) and day (01-31) bounds
+        month = int(ts[5:7])
+        day = int(ts[8:10])
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return ts
+        # Fall through to normalization path
+    try:
+        parts = ts.split('T', 1)
+        dp = parts[0].split('-')
+        if len(dp) == 3:
+            fixed = (
+                f"{int(dp[0]):04d}-"
+                f"{int(dp[1]):02d}-"
+                f"{int(dp[2]):02d}"
+            )
+            if len(parts) > 1:
+                return fixed + 'T' + parts[1]
+            return fixed
+    except (ValueError, IndexError):
+        pass
+    return ts

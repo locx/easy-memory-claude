@@ -64,15 +64,20 @@ def maybe_reload_recall_counts():
         return
     if mtime == recall_mtime:
         return
-    recall_mtime = mtime
     try:
         with open(recall_path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             for k, v in data.items():
+                if not isinstance(k, str):
+                    continue
+                if not isinstance(v, (int, float)):
+                    continue
                 cur = recall_counts.get(k, 0)
                 if v > cur:
                     recall_counts[k] = v
+        # Update mtime only after successful read
+        recall_mtime = mtime
     except (OSError, json.JSONDecodeError, ValueError):
         pass
 
@@ -102,21 +107,23 @@ def flush_recall_counts():
     that can be regenerated.
     """
     global recall_dirty, recall_last_flush, recall_mtime
-    if not recall_path or not recall_counts:
+    if not recall_path:
         recall_dirty = False
         return
-    recall_dirty = False
+    if not recall_dirty:
+        return
     recall_last_flush = time.monotonic()
     tmp = recall_path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(
-                dict(recall_counts), f,
+                recall_counts, f,
                 separators=(",", ":"),
             )
             f.flush()
-            # No fsync — recall data is non-critical
         os.replace(tmp, recall_path)
+        # Only clear dirty after successful write+replace
+        recall_dirty = False
         try:
             recall_mtime = os.path.getmtime(recall_path)
         except OSError:

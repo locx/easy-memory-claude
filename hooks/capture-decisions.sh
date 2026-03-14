@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stop hook: one-time-per-session reminder to persist decisions.
+# Stop hook: structured decision capture + session summary.
 # Global — works for any project with .memory/ dir.
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] || exit 0
 [ -d "${CLAUDE_PROJECT_DIR}/.memory" ] || exit 0
@@ -15,5 +15,24 @@ fi
 
 touch "$MARKER"
 
-echo "Reminder: If this conversation produced important decisions, architectural patterns, or user preferences worth preserving, use the MCP memory tools (create_entities, create_relations, add_observations) to store them in the knowledge graph."
+cat << 'MSG'
+If this session involved trade-off evaluations, approach selections,
+or architectural decisions, persist them with create_decision:
+
+  create_decision({
+    title: "what was decided",
+    rationale: "why this approach",
+    alternatives: ["rejected option -- reason"],
+    scope: "affected code area",
+    related_entities: ["ComponentName"]
+  })
+
+For file-specific warnings (gotchas, fragile areas, known issues):
+
+  create_entities([{
+    name: "filename.py",
+    entityType: "file-warning",
+    observations: ["[WARNING] description of the gotcha"]
+  }])
+MSG
 exit 0
