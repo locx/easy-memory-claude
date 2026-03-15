@@ -133,7 +133,7 @@ echo ""
 echo "[4/5] Deploying global hooks..."
 
 HOOK_SRC="${SCRIPT_DIR}/hooks"
-for hook in prime-memory.sh capture-decisions.sh nudge-setup.sh capture-tool-context.sh capture_tool_context.py; do
+for hook in prime-memory.sh capture-decisions.sh nudge-setup.sh capture-tool-context.sh capture_tool_context.py smart_recall.py; do
     if [ ! -f "${HOOK_SRC}/${hook}" ]; then
         echo "  ERROR: ${HOOK_SRC}/${hook} not found."
         echo "         Run this installer from the easy-memory-claude project directory."
@@ -271,7 +271,7 @@ echo "============================================================"
 echo "  Installation complete!"
 echo ""
 echo "  Runtime:       ~/.claude/memory/ (2 scripts)"
-echo "  Hooks:         ~/.claude/hooks/  (4 hooks)"
+echo "  Hooks:         ~/.claude/hooks/  (6 hooks)"
 echo "  Settings:      ~/.claude/settings.json"
 echo "  Dev/source:    ${SCRIPT_DIR}/"
 echo ""

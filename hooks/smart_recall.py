@@ -18,6 +18,27 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
+_MAIN_BRANCHES = frozenset({
+    "main", "master", "trunk", "develop",
+})
+
+
+def _read_git_head(project_dir):
+    """Read branch from .git/HEAD. <0.1ms file read."""
+    git_head = os.path.join(project_dir, ".git", "HEAD")
+    try:
+        with open(git_head) as f:
+            content = f.read(256).strip()
+        if content.startswith("ref: refs/heads/"):
+            return content[16:]
+        if content.startswith("ref: "):
+            return content[5:].rsplit("/", 1)[-1]
+        if len(content) >= 8:
+            return content[:12]
+        return ""
+    except OSError:
+        return ""
+
 
 def _parse_iso_days_ago(ts, now_ts):
     """Return days since timestamp, or 999 if unparseable."""
@@ -47,15 +68,29 @@ def _load_recall_counts(memory_dir):
     return {}
 
 
+_MAX_ENTITY_COUNT = 100_000
+_MAX_LINE_LEN = 10_000_000
+_PARSE_TIME_BUDGET = 10.0
+
+
 def _load_graph(memory_dir):
     """Single-pass graph load into entities + relations."""
     graph_path = os.path.join(memory_dir, "graph.jsonl")
     entities = {}
     relations = []
+    rel_seen = set()
+    deadline = time.monotonic() + _PARSE_TIME_BUDGET
+    line_count = 0
     try:
         with open(graph_path, encoding="utf-8",
                   errors="replace") as f:
             for line in f:
+                line_count += 1
+                if len(line) > _MAX_LINE_LEN:
+                    continue
+                if line_count % 1000 == 0:
+                    if time.monotonic() > deadline:
+                        break
                 line = line.strip()
                 if not line:
                     continue
@@ -70,23 +105,12 @@ def _load_graph(memory_dir):
                             continue
                         if name in entities:
                             prev = entities[name]
-                            # Use try/except for non-hashable
-                            # observations (dicts, lists)
-                            try:
-                                seen = set(
-                                    prev["observations"]
-                                )
-                            except TypeError:
-                                seen = {
-                                    str(o) for o
-                                    in prev["observations"]
-                                }
+                            seen = set(prev["observations"])
                             for o in obj.get(
                                 "observations", []
                             ):
-                                if not isinstance(o, str):
-                                    continue
-                                if o not in seen:
+                                if isinstance(o, str) \
+                                        and o not in seen:
                                     prev["observations"].append(o)
                                     seen.add(o)
                             new_u = obj.get("_updated", "")
@@ -95,7 +119,15 @@ def _load_graph(memory_dir):
                                 or new_u > prev["_updated"]
                             ):
                                 prev["_updated"] = new_u
+                            # First-writer-wins for _branch
+                            b = obj.get("_branch", "")
+                            if b and not prev.get(
+                                "_branch"
+                            ):
+                                prev["_branch"] = b
                         else:
+                            if len(entities) >= _MAX_ENTITY_COUNT:
+                                continue
                             obs = obj.get("observations", [])
                             entities[name] = {
                                 "entityType": obj.get(
@@ -111,12 +143,17 @@ def _load_graph(memory_dir):
                                 "_updated": obj.get(
                                     "_updated", ""
                                 ),
+                                "_branch": obj.get(
+                                    "_branch", ""
+                                ),
                             }
                     elif t == "relation":
                         fr = obj.get("from", "")
                         to = obj.get("to", "")
                         rt = obj.get("relationType", "")
-                        if fr and to:
+                        rk = (fr, to, rt)
+                        if fr and to and rk not in rel_seen:
+                            rel_seen.add(rk)
                             relations.append(
                                 (fr, to, rt)
                             )
@@ -127,8 +164,10 @@ def _load_graph(memory_dir):
     return entities, relations
 
 
-def _score_entity(info, now_ts, recall_counts, name):
-    """Score: obs_count / (1 + days_stale) * recall_boost."""
+def _score_entity(info, now_ts, recall_counts, name,
+                  current_branch):
+    """Score: obs_count / (1 + days_stale) * recall_boost
+    * branch_boost."""
     obs = info.get("observations", [])
     obs_count = len(obs)
     if obs_count == 0:
@@ -142,6 +181,14 @@ def _score_entity(info, now_ts, recall_counts, name):
     rc = recall_counts.get(name, 0)
     if isinstance(rc, (int, float)) and rc > 0:
         score *= (1.0 + math.log(rc))
+    # Branch boost — fixed factors (no cosine sim here)
+    entity_branch = info.get("_branch", "")
+    if (entity_branch and current_branch
+            and entity_branch != current_branch):
+        if entity_branch in _MAIN_BRANCHES:
+            score *= 0.95
+        else:
+            score *= 0.85
     return score
 
 
@@ -219,14 +266,9 @@ def main():
         sys.exit(1)
     memory_dir = sys.argv[1]
 
-    graph_path = os.path.join(memory_dir, "graph.jsonl")
-    if not os.path.exists(graph_path) \
-            or os.path.getsize(graph_path) == 0:
-        print(
-            "Memory graph is empty. Use create_entities "
-            "or create_decision to build knowledge."
-        )
-        return
+    # Detect current branch for scoring boost
+    project_dir = os.path.dirname(memory_dir)
+    current_branch = _read_git_head(project_dir) or ""
 
     entities, relations = _load_graph(memory_dir)
     if not entities:
@@ -248,7 +290,8 @@ def main():
         if etype == "activity-log":
             continue
         score = _score_entity(
-            info, now_ts, recall_counts, name
+            info, now_ts, recall_counts, name,
+            current_branch,
         )
         if score > 0:
             scored.append((score, name, info))
@@ -314,6 +357,8 @@ def main():
     if n_warnings:
         stats_parts.append(f"{n_warnings} warnings")
     stats_parts.append(f"maintained {maint_ago}")
+    if current_branch:
+        stats_parts.append(f"branch: {current_branch}")
     print(f"\nMemory: {' | '.join(stats_parts)}")
 
     # Tool reminder

@@ -4,7 +4,10 @@ import sys
 
 from ._json import dumps as _fast_dumps
 
-from .config import PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION
+from .config import (
+    PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION,
+    reset_session_stats, log_event, refresh_branch,
+)
 from .graph import load_index
 from .recall import load_recall_counts
 from .search import search, search_by_time
@@ -19,375 +22,16 @@ from .tools import (
 )
 from .traverse import traverse_relations
 
-TOOLS = [
-    {
-        "name": "semantic_search_memory",
-        "description": (
-            "Search the memory knowledge graph using "
-            "TF-IDF semantic similarity. Returns entities "
-            "ranked by relevance to the query, with their "
-            "type and top observations."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "Natural language search query"
-                    ),
-                },
-                "top_k": {
-                    "type": "integer",
-                    "description": (
-                        "Number of results to return "
-                        "(default 5)"
-                    ),
-                    "default": 5,
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "traverse_relations",
-        "description": (
-            "Traverse the memory knowledge graph from a "
-            "start entity, following relations up to "
-            "max_depth hops. Returns connected subgraph "
-            "with nodes and edges."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entity": {
-                    "type": "string",
-                    "description": "Start entity name",
-                },
-                "direction": {
-                    "type": "string",
-                    "enum": [
-                        "outbound", "inbound", "both"
-                    ],
-                    "description": (
-                        "Traversal direction (default both)"
-                    ),
-                    "default": "both",
-                },
-                "max_depth": {
-                    "type": "integer",
-                    "description": (
-                        "Max hops to traverse (1-5, "
-                        "default 2)"
-                    ),
-                    "default": 2,
-                },
-            },
-            "required": ["entity"],
-        },
-    },
-    {
-        "name": "search_memory_by_time",
-        "description": (
-            "Search memory entities by time range. "
-            "Returns entities updated/created within the "
-            "window, sorted by most recent first."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "since": {
-                    "type": "string",
-                    "description": (
-                        "ISO date start (e.g. "
-                        "2026-03-01T00:00:00Z)"
-                    ),
-                },
-                "until": {
-                    "type": "string",
-                    "description": (
-                        "ISO date end (e.g. "
-                        "2026-03-13T23:59:59Z)"
-                    ),
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": (
-                        "Max results (default 20)"
-                    ),
-                    "default": 20,
-                },
-            },
-        },
-    },
-    {
-        "name": "create_entities",
-        "description": (
-            "Create or merge entities in the knowledge "
-            "graph. If an entity with the same name exists, "
-            "observations are merged and _updated refreshed."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entities": {
-                    "type": "array",
-                    "description": (
-                        "List of entities to create"
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": (
-                                    "Entity name"
-                                ),
-                            },
-                            "entityType": {
-                                "type": "string",
-                                "description": (
-                                    "Type (Module, "
-                                    "Component, Pattern, "
-                                    "Architecture, etc.)"
-                                ),
-                            },
-                            "observations": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string",
-                                },
-                                "description": (
-                                    "Facts about the "
-                                    "entity"
-                                ),
-                            },
-                        },
-                        "required": [
-                            "name", "entityType",
-                            "observations",
-                        ],
-                    },
-                },
-            },
-            "required": ["entities"],
-        },
-    },
-    {
-        "name": "create_relations",
-        "description": (
-            "Create directed relations between entities. "
-            "Duplicates are silently skipped."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "relations": {
-                    "type": "array",
-                    "description": (
-                        "List of relations to create"
-                    ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "from": {
-                                "type": "string",
-                                "description": (
-                                    "Source entity name"
-                                ),
-                            },
-                            "to": {
-                                "type": "string",
-                                "description": (
-                                    "Target entity name"
-                                ),
-                            },
-                            "relationType": {
-                                "type": "string",
-                                "description": (
-                                    "Relation type "
-                                    "(uses, contains, "
-                                    "imports, etc.)"
-                                ),
-                            },
-                        },
-                        "required": [
-                            "from", "to",
-                            "relationType",
-                        ],
-                    },
-                },
-            },
-            "required": ["relations"],
-        },
-    },
-    {
-        "name": "add_observations",
-        "description": (
-            "Add new observations to an existing entity. "
-            "Duplicate observations are skipped."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entity": {
-                    "type": "string",
-                    "description": "Entity name",
-                },
-                "observations": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "New observations to add"
-                    ),
-                },
-            },
-            "required": ["entity", "observations"],
-        },
-    },
-    {
-        "name": "delete_entities",
-        "description": (
-            "Delete entities by name. Relations involving "
-            "deleted entities are cascade-removed."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entity_names": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Names of entities to delete"
-                    ),
-                },
-            },
-            "required": ["entity_names"],
-        },
-    },
-    {
-        "name": "create_decision",
-        "description": (
-            "Record an architectural or design decision "
-            "with structured rationale, rejected "
-            "alternatives, and outcome tracking. Use this "
-            "when the session involved choosing between "
-            "approaches, evaluating trade-offs, or making "
-            "scoping decisions."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "What was decided",
-                },
-                "rationale": {
-                    "type": "string",
-                    "description": (
-                        "Why this approach was chosen"
-                    ),
-                },
-                "alternatives": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Rejected alternatives with "
-                        "reasons (e.g. 'Vector clocks "
-                        "-- too complex for single-"
-                        "writer model')"
-                    ),
-                },
-                "scope": {
-                    "type": "string",
-                    "description": (
-                        "What code/area this affects"
-                    ),
-                },
-                "outcome": {
-                    "type": "string",
-                    "enum": [
-                        "pending", "successful",
-                        "failed", "revised",
-                        "adopted", "rejected",
-                        "deferred",
-                    ],
-                    "description": (
-                        "Current outcome status "
-                        "(default: pending)"
-                    ),
-                    "default": "pending",
-                },
-                "related_entities": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Entity names to link this "
-                        "decision to via relations"
-                    ),
-                },
-            },
-            "required": ["title", "rationale"],
-        },
-    },
-    {
-        "name": "update_decision_outcome",
-        "description": (
-            "Update a decision's outcome and optionally "
-            "record a lesson learned. Use when returning "
-            "to work affected by a prior decision to "
-            "close the learning loop."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": (
-                        "Decision title (with or without "
-                        "'decision: ' prefix)"
-                    ),
-                },
-                "outcome": {
-                    "type": "string",
-                    "enum": [
-                        "successful", "failed", "revised",
-                        "adopted", "rejected", "deferred",
-                    ],
-                    "description": "How it turned out",
-                },
-                "lesson": {
-                    "type": "string",
-                    "description": (
-                        "What was learned from this "
-                        "decision"
-                    ),
-                },
-            },
-            "required": ["title", "outcome"],
-        },
-    },
-    {
-        "name": "graph_stats",
-        "description": (
-            "Return graph health statistics: entity/"
-            "relation counts, type breakdown, index age, "
-            "recall rankings, pending decisions, and "
-            "current session activity counters."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
-    },
-]
+# Load tool schemas from external JSON (292L data, not code)
+import importlib.resources as _res
+with _res.files(__package__).joinpath(
+    "tools_schema.json"
+).open() as _f:
+    TOOLS = json.load(_f)
 
 
 def handle_message(msg, memory_dir):
-    """Handle a single JSON-RPC 2.0 message.
-
-    Wraps tool calls in try/except for robustness.
-    """
+    """Handle a single JSON-RPC 2.0 message."""
     if not isinstance(msg, dict):
         return None
 
@@ -398,8 +42,8 @@ def handle_message(msg, memory_dir):
         params = {}
 
     if method == "initialize":
-        from .logging import reset_session_stats, log_event
         reset_session_stats()
+        refresh_branch()
         load_index(memory_dir)
         load_recall_counts(memory_dir)
         log_event("INIT", "session started")
@@ -435,6 +79,7 @@ def handle_message(msg, memory_dir):
                     args.get("query", ""),
                     memory_dir,
                     args.get("top_k", 5),
+                    branch=args.get("branch"),
                 )
             elif tool_name == "traverse_relations":
                 result = traverse_relations(
@@ -449,6 +94,9 @@ def handle_message(msg, memory_dir):
                     args.get("since"),
                     args.get("until"),
                     args.get("limit", 20),
+                    branch_filter=args.get(
+                        "branch_filter"
+                    ),
                 )
             elif tool_name == "create_entities":
                 result = create_entities(
@@ -505,22 +153,27 @@ def handle_message(msg, memory_dir):
                 "results": [],
             }
 
+        is_err = isinstance(result, dict) and "error" in result
+
         try:
             result_text = _fast_dumps(result)
         except (TypeError, ValueError, OverflowError):
             result_text = _fast_dumps({
                 "error": "Result not serializable",
-                "results": [],
             })
+            is_err = True
+        resp_content = {
+            "content": [{
+                "type": "text",
+                "text": result_text,
+            }],
+        }
+        if is_err:
+            resp_content["isError"] = True
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {
-                "content": [{
-                    "type": "text",
-                    "text": result_text,
-                }],
-            },
+            "result": resp_content,
         }
 
     if method.startswith("notifications/"):

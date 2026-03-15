@@ -61,26 +61,19 @@ _DEFAULTS = {
 # Mutable config — populated by _load_config()
 _cfg = dict(_DEFAULTS)
 
-_CONFIG_KEYS = {
-    "decay_threshold": ("DECAY_THRESHOLD", (int, float)),
-    "max_age_days": ("MAX_AGE_DAYS", int),
-    "throttle_hours": ("THROTTLE_HOURS", (int, float)),
-    "min_merge_name_len": ("MIN_MERGE_NAME_LEN", int),
-    "max_log_bytes": ("MAX_LOG_BYTES", int),
-}
 
-# Validation bounds for config values
-_CONFIG_BOUNDS = {
-    "DECAY_THRESHOLD": (0.0, 10.0),
-    "MAX_AGE_DAYS": (1, 3650),
-    "THROTTLE_HOURS": (0.1, 720),
-    "MIN_MERGE_NAME_LEN": (1, 100),
-    "MAX_LOG_BYTES": (1000, 100_000_000),
-}
+def _valid(cfg, key, types, lo, hi):
+    """Return cfg[key] if valid type + in bounds, else None."""
+    v = cfg.get(key)
+    if (v is not None and isinstance(v, types)
+            and not isinstance(v, bool)
+            and lo <= v <= hi):
+        return v
+    return None
 
 
 def _load_config(memory_dir):
-    """Load per-project config with validation + atomic apply."""
+    """Load per-project config with inline validation."""
     cfg_path = os.path.join(memory_dir, "config.json")
     try:
         with open(cfg_path, encoding="utf-8") as f:
@@ -89,19 +82,22 @@ def _load_config(memory_dir):
         return
     if not isinstance(cfg, dict):
         return
-    # Build validated overrides first, then apply atomically
     overrides = {}
-    for key, (gname, types) in _CONFIG_KEYS.items():
-        if key in cfg and isinstance(cfg[key], types) \
-                and not isinstance(cfg[key], bool):
-            val = cfg[key]
-            bounds = _CONFIG_BOUNDS.get(gname)
-            if bounds:
-                lo, hi = bounds
-                if val < lo or val > hi:
-                    continue
-            overrides[gname] = val
-    # Atomic apply — all or nothing per valid key
+    for json_key, cfg_key, types, lo, hi in (
+        ("decay_threshold", "DECAY_THRESHOLD",
+         (int, float), 0.0, 10.0),
+        ("max_age_days", "MAX_AGE_DAYS",
+         int, 1, 3650),
+        ("throttle_hours", "THROTTLE_HOURS",
+         (int, float), 0.1, 720),
+        ("min_merge_name_len", "MIN_MERGE_NAME_LEN",
+         int, 1, 100),
+        ("max_log_bytes", "MAX_LOG_BYTES",
+         int, 1000, 100_000_000),
+    ):
+        v = _valid(cfg, json_key, types, lo, hi)
+        if v is not None:
+            overrides[cfg_key] = v
     _cfg.update(overrides)
 
 
@@ -251,26 +247,19 @@ def score_entity(entity, now, recall_counts=None,
         return 0.0
 
     updated = entity.get("_updated", "")
-    if not updated:
+    if (not updated
+            or (cutoff_str and updated < cutoff_str)):
         days = _cfg["MAX_AGE_DAYS"]
-    elif cutoff_str and updated < cutoff_str:
-        # Fast path: clearly old, skip datetime parse
-        days = _cfg["MAX_AGE_DAYS"]
-    elif now_ts:
-        # Epoch-based calculation — avoids datetime math
+    else:
         dt = parse_iso_date(updated)
-        if dt:
+        if not dt:
+            days = _cfg["MAX_AGE_DAYS"]
+        elif now_ts:
             days = max(
                 int((now_ts - dt.timestamp()) / 86400), 0
             )
         else:
-            days = _cfg["MAX_AGE_DAYS"]
-    else:
-        dt = parse_iso_date(updated)
-        if dt:
             days = max((now - dt).days, 0)
-        else:
-            days = _cfg["MAX_AGE_DAYS"]
 
     recency = 1.0 / (1.0 + days)
     score = obs_count * recency
@@ -332,47 +321,25 @@ def normalize_name(name):
     return _RE_SEPS.sub(' ', name.lower().strip())
 
 
-def _obs_to_str(obs):
-    """Normalize a single observation to a string."""
-    if isinstance(obs, str):
-        return obs
-    try:
-        return json.dumps(obs, sort_keys=True)
-    except Exception:
-        return str(obs)
-
-
-def _safe_obs_set(observations):
-    """Convert observations to a dedup collection.
-
-    Returns set for all-string observations (>95% case) —
-    ~40% less memory than dict with identity mappings.
-    Returns dict {normalized_key: original_value} for
-    mixed types to preserve original non-string values.
-    """
+def _safe_obs_dedup(observations):
+    """Deduplicate observations preserving insertion order."""
     if not observations:
-        return set()
-    # Fast path — set for all-string (common case)
-    if isinstance(observations[0], str):
-        all_str = True
-        for obs in observations:
-            if not isinstance(obs, str):
-                all_str = False
-                break
-        if all_str:
-            return set(observations)
-    result = {}
-    for obs in observations:
-        if isinstance(obs, str):
-            if obs not in result:
-                result[obs] = obs
-        else:
-            key = _obs_to_str(obs)
-            if key not in result:
-                result[key] = obs
+        return []
+    seen = set()
+    result = []
+    for o in observations:
+        key = (o if isinstance(o, str)
+               else json.dumps(o, sort_keys=True))
+        if key not in seen:
+            seen.add(key)
+            result.append(o)
     return result
 
 
+_MAIN_BRANCHES = frozenset({
+    "main", "master", "trunk", "develop",
+})
+_GUARD_AGE_DAYS = 7
 _MAX_CONSOLIDATE_ENTITIES = 50_000
 
 
@@ -402,6 +369,12 @@ def consolidate(entities, relations):
         return entities, relations, 0
 
     min_merge = _cfg["MIN_MERGE_NAME_LEN"]
+
+    # Age-gated cross-branch consolidation guard
+    guard_cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(days=_GUARD_AGE_DAYS)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Build sort keys: (entityType, normalized_name, idx)
     n = len(entities)
@@ -449,9 +422,9 @@ def consolidate(entities, relations):
                 continue
 
             len_j = len(norm_j)
-            # Length ratio check — skip impossible
-            # substring containment
-            if len_i > 3 * len_j or len_j > 3 * len_i:
+            # Length ratio check — tightened to 2x
+            # to prevent false merges on common names
+            if len_i > 2 * len_j or len_j > 2 * len_i:
                 continue
 
             # Short names merge only on exact match
@@ -460,35 +433,47 @@ def consolidate(entities, relations):
                 if norm_i != norm_j:
                     continue
 
-            if norm_i in norm_j or norm_j in norm_i:
+            # Word-boundary containment — prevents
+            # "config" merging with "project config"
+            # unless one is a proper word-boundary
+            # substring of the other.
+            padded_i = f" {norm_i} "
+            padded_j = f" {norm_j} "
+            if (norm_i == norm_j
+                    or padded_i in padded_j
+                    or padded_j in padded_i):
                 ent_j = entities[idx_j]
-                # Lazy obs dict — built once per absorber
+                # Cross-branch guard: block merging
+                # young entities from different features
+                bi = ent_i.get("_branch", "")
+                bj = ent_j.get("_branch", "")
+                if (bi and bj and bi != bj
+                        and bi not in _MAIN_BRANCHES
+                        and bj not in _MAIN_BRANCHES):
+                    ci = ent_i.get("_created", "")
+                    cj = ent_j.get("_created", "")
+                    if (ci and ci > guard_cutoff
+                            and cj
+                            and cj > guard_cutoff):
+                        continue
+                # Lazy dedup — built once per absorber
                 if obs_dict_i is None:
-                    obs_dict_i = _safe_obs_set(
+                    obs_dict_i = _safe_obs_dedup(
                         ent_i.get("observations", [])
                     )
-                j_obs = _safe_obs_set(
-                    ent_j.get("observations", [])
-                )
-                # Merge: set|set → union, else dict merge
-                if isinstance(obs_dict_i, set):
-                    if isinstance(j_obs, set):
-                        obs_dict_i |= j_obs
-                    else:
-                        obs_dict_i = {
-                            o: o for o in obs_dict_i
-                        }
-                        for k, v in j_obs.items():
-                            if k not in obs_dict_i:
-                                obs_dict_i[k] = v
-                elif isinstance(j_obs, set):
-                    for o in j_obs:
-                        if o not in obs_dict_i:
-                            obs_dict_i[o] = o
-                else:
-                    for k, v in j_obs.items():
-                        if k not in obs_dict_i:
-                            obs_dict_i[k] = v
+                    _seen_i = {
+                        (o if isinstance(o, str)
+                         else json.dumps(
+                             o, sort_keys=True))
+                        for o in obs_dict_i
+                    }
+                for o in ent_j.get("observations", []):
+                    key = (o if isinstance(o, str)
+                           else json.dumps(
+                               o, sort_keys=True))
+                    if key not in _seen_i:
+                        _seen_i.add(key)
+                        obs_dict_i.append(o)
                 # Keep newer _updated
                 upd_j = ent_j.get("_updated", "")
                 upd_i = ent_i.get("_updated", "")
@@ -502,16 +487,8 @@ def consolidate(entities, relations):
                 )
                 merged_count += 1
 
-        # Deferred list conversion — once per absorber
         if obs_dict_i is not None:
-            if isinstance(obs_dict_i, set):
-                ent_i["observations"] = list(
-                    obs_dict_i
-                )
-            else:
-                ent_i["observations"] = list(
-                    obs_dict_i.values()
-                )
+            ent_i["observations"] = list(obs_dict_i)
 
     # Free sort key list
     del keyed
@@ -534,15 +511,11 @@ def consolidate(entities, relations):
             e["observations"] = obs[-cap:]
 
     # Resolve transitive rename chains (A→B→C → A→C)
-    max_iter = min(len(renames), 100) if renames else 0
-    for _iter in range(max_iter):
-        changed = False
-        for k, v in list(renames.items()):
-            if v in renames and renames[v] != v:
-                renames[k] = renames[v]
-                changed = True
-        if not changed:
-            break
+    for k in list(renames):
+        v = renames[k]
+        while v in renames and renames[v] != v:
+            v = renames[v]
+        renames[k] = v
 
     # Update relation references, drop self-refs + dupes
     updated_rels = []
@@ -665,6 +638,7 @@ def build_tfidf_index(entities, memory_dir):
             meta[name] = {
                 "entityType": etype,
                 "observations": obs_strs[:5],
+                "_branch": ent.get("_branch", ""),
             }
             for w in set(words):
                 df[w] += 1
@@ -752,20 +726,11 @@ def build_tfidf_index(entities, memory_dir):
 
 
 def log_pruned(memory_dir, pruned_count, merged_count):
-    """Append maintenance event to pruned.log.
-
-    Rotates when log exceeds MAX_LOG_BYTES.
-    """
+    """Append to pruned.log, rotate if oversized."""
     log_path = os.path.join(memory_dir, "pruned.log")
     try:
-        if (os.path.exists(log_path)
-                and os.path.getsize(log_path)
-                > _cfg["MAX_LOG_BYTES"]):
-            bak = log_path + ".old"
-            try:
-                os.replace(log_path, bak)
-            except OSError:
-                pass
+        if os.path.getsize(log_path) > _cfg["MAX_LOG_BYTES"]:
+            os.replace(log_path, log_path + ".old")
     except OSError:
         pass
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -781,38 +746,43 @@ def log_pruned(memory_dir, pruned_count, merged_count):
 
 def _print_graph_stats(entities, n_relations, pruned,
                        merged, memory_dir):
-    """Print graph health statistics after maintenance."""
+    """Print graph health statistics."""
     if not entities:
         return
+    n = len(entities)
     type_counts = Counter(
         e.get("entityType", "unknown") for e in entities
     )
-    obs_counts = [
-        len(e.get("observations", [])) for e in entities
-    ]
-    avg_obs = (
-        sum(obs_counts) / len(obs_counts) if obs_counts
-        else 0
-    )
+    avg_obs = sum(
+        len(e.get("observations", []))
+        for e in entities
+    ) / n
     dates = [
         e.get("_created") or e.get("_updated", "")
         for e in entities
     ]
     dates = [d for d in dates if d]
-    idx_path = os.path.join(memory_dir, "tfidf_index.json")
     idx_kb = 0
     try:
-        idx_kb = os.path.getsize(idx_path) // 1024
+        idx_kb = os.path.getsize(
+            os.path.join(memory_dir, "tfidf_index.json")
+        ) // 1024
     except OSError:
         pass
-    print(f"=== Graph Stats: {len(entities)} entities, "
+    print(f"=== Graph: {n} entities, "
           f"{n_relations} relations ===")
     for t, c in type_counts.most_common(10):
         print(f"  {t}: {c}")
-    print(f"  avg observations/entity: {avg_obs:.1f}")
+    print(f"  avg obs/entity: {avg_obs:.1f}")
     if dates:
-        print(f"  oldest: {min(dates)}  newest: {max(dates)}")
-    print(f"  pruned={pruned}  merged={merged}  "
+        print(f"  oldest: {min(dates)}  "
+              f"newest: {max(dates)}")
+    branch_counts = Counter(
+        e.get("_branch", "unknown") for e in entities
+    )
+    for b, c in branch_counts.most_common(5):
+        print(f"  branch {b}: {c}")
+    print(f"  pruned={pruned} merged={merged} "
           f"index={idx_kb}KB")
 
 
@@ -1025,7 +995,8 @@ def run(project_dir):
     index_input = [
         {"name": e.get("name", ""),
          "entityType": e.get("entityType", ""),
-         "observations": e.get("observations", [])}
+         "observations": e.get("observations", []),
+         "_branch": e.get("_branch", "")}
         for e in entities
     ]
     del entities

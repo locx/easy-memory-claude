@@ -14,7 +14,10 @@ from .config import (
     MAX_OBS_LENGTH,
     MAX_OBS_PER_CALL,
     MAX_RELATIONS_PER_CALL,
+    get_current_branch,
+    log_event,
     now_iso,
+    session_stats,
 )
 from .graph import (
     _obs_dedup_key,
@@ -27,8 +30,6 @@ from .graph import (
     load_graph_relations,
     rewrite_graph,
 )
-from .cache import entity_cache, relation_cache
-from .logging import log_event, session_stats
 
 _DECISION_PREFIX = "decision: "
 _DECISION_PREFIX_LEN = len(_DECISION_PREFIX)
@@ -52,6 +53,7 @@ def create_entities(entities_input, memory_dir):
         return size_err
 
     now = now_iso()
+    branch = get_current_branch()
     new_entries = []
 
     for ent in entities_input:
@@ -79,6 +81,7 @@ def create_entities(entities_input, memory_dir):
             "name": name,
             "entityType": etype,
             "observations": obs,
+            "_branch": branch,
             "_created": now,
             "_updated": now,
         })
@@ -202,12 +205,12 @@ def add_observations(entity_name, observations,
 
     now = now_iso()
 
-    # Load entities to verify existence and dedup.
-    # Always load — cold cache previously caused blind
-    # appends to non-existent entities (ghost writes).
-    cached = entity_cache["data"]
-    if cached is None:
-        cached = load_graph_entities(memory_dir)
+    # Always load via load_graph_entities — respects
+    # mtime/append_only flags for cache coherence.
+    # Direct entity_cache["data"] read caused false
+    # "not found" after create_entities in same session
+    # (stale cache, append_only flag not honored).
+    cached = load_graph_entities(memory_dir)
     if entity_name not in cached:
         return {
             "error": (
@@ -255,10 +258,22 @@ def add_observations(entity_name, observations,
     return {"added": total}
 
 
-def delete_entities(entity_names, memory_dir):
-    """Delete entities and cascade-remove relations."""
+def delete_entities(entity_names, memory_dir,
+                    _retry=False):
+    """Delete entities and cascade-remove relations.
+
+    Uses mtime guard to detect concurrent writes between
+    load and rewrite — retries once with fresh data.
+    """
     if not isinstance(entity_names, list):
         return {"error": "entity_names must be a list"}
+
+    # Capture mtime before loading
+    graph_path = os.path.join(memory_dir, "graph.jsonl")
+    try:
+        pre_mtime = os.path.getmtime(graph_path)
+    except OSError:
+        pre_mtime = 0.0
 
     entities = load_graph_entities(memory_dir)
     to_delete = {
@@ -283,7 +298,24 @@ def delete_entities(entity_names, memory_dir):
         and r.get("to") not in to_delete
     ]
 
-    rewrite_graph(memory_dir, remaining, kept_rels)
+    # Check for concurrent modification before rewrite
+    try:
+        post_mtime = os.path.getmtime(graph_path)
+    except OSError:
+        post_mtime = 0.0
+    if post_mtime != pre_mtime and not _retry:
+        invalidate_caches()
+        return delete_entities(
+            entity_names, memory_dir, _retry=True,
+        )
+
+    try:
+        rewrite_graph(memory_dir, remaining, kept_rels)
+    except OSError:
+        return {
+            "error": "Write failed (lock timeout)",
+            "deleted": 0,
+        }
     invalidate_caches()
 
     n_del = len(to_delete)
@@ -355,8 +387,11 @@ def create_decision(args, memory_dir):
         }],
         memory_dir,
     )
+    if "error" in result:
+        return result
 
     related = args.get("related_entities", [])
+    rel_result = None
     if isinstance(related, list) and related:
         rel_entries = []
         for target in related[:10]:
@@ -368,17 +403,26 @@ def create_decision(args, memory_dir):
                     "relationType": "decided-for",
                 })
         if rel_entries:
-            create_relations(rel_entries, memory_dir)
+            rel_result = create_relations(
+                rel_entries, memory_dir
+            )
 
     log_event(
         "DECISION",
         f'"{title}" outcome={outcome}',
     )
-    return {
+    resp = {
         "created": result.get("created", 0),
         "decision": entity_name,
         "outcome": outcome,
     }
+    if rel_result and "error" in rel_result:
+        resp["relations_error"] = rel_result["error"]
+    elif rel_result:
+        resp["relations_created"] = rel_result.get(
+            "created", 0
+        )
+    return resp
 
 
 def update_decision_outcome(args, memory_dir):
@@ -447,6 +491,17 @@ def update_decision_outcome(args, memory_dir):
     }
 
 
+def _file_info(path):
+    """Return (mtime_iso, size_kb) or (None, 0)."""
+    try:
+        mt = os.path.getmtime(path)
+        return time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(mt)
+        ), os.path.getsize(path) // 1024
+    except OSError:
+        return None, 0
+
+
 def graph_stats(memory_dir):
     """Return graph health and session stats."""
     entities = load_graph_entities(memory_dir)
@@ -457,42 +512,20 @@ def graph_stats(memory_dir):
         for info in entities.values()
     )
 
-    graph_path = os.path.join(
-        memory_dir, "graph.jsonl"
+    branch_counts = Counter(
+        info.get("_branch", "unknown")
+        for info in entities.values()
     )
-    graph_kb = 0
-    try:
-        graph_kb = os.path.getsize(graph_path) // 1024
-    except OSError:
-        pass
 
-    index_path = os.path.join(
-        memory_dir, "tfidf_index.json"
+    _, graph_kb = _file_info(
+        os.path.join(memory_dir, "graph.jsonl")
     )
-    index_age = "not built"
-    index_kb = 0
-    try:
-        mtime = os.path.getmtime(index_path)
-        index_age = time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ",
-            time.gmtime(mtime),
-        )
-        index_kb = os.path.getsize(index_path) // 1024
-    except OSError:
-        pass
-
-    marker = os.path.join(
-        memory_dir, ".last-maintenance"
+    index_age, index_kb = _file_info(
+        os.path.join(memory_dir, "tfidf_index.json")
     )
-    last_maint = "never"
-    try:
-        mtime = os.path.getmtime(marker)
-        last_maint = time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ",
-            time.gmtime(mtime),
-        )
-    except OSError:
-        pass
+    last_maint, _ = _file_info(
+        os.path.join(memory_dir, ".last-maintenance")
+    )
 
     try:
         from .recall import recall_counts as _rc
@@ -507,30 +540,31 @@ def graph_stats(memory_dir):
     except Exception:
         top_recall = []
 
-    n_pending = 0
-    for name, info in entities.items():
-        if info.get("entityType") != "decision":
-            continue
-        obs = info.get("observations", [])
-        has_final = any(
+    n_pending = sum(
+        1 for info in entities.values()
+        if info.get("entityType") == "decision"
+        and not any(
             isinstance(o, str)
             and o.startswith("Outcome: ")
             and not o.startswith("Outcome: pending")
-            for o in obs
+            for o in info.get("observations", [])
         )
-        if not has_final:
-            n_pending += 1
+    )
 
     result = {
         "entities": len(entities),
         "relations": len(relations),
         "graph_size_kb": graph_kb,
         "index_size_kb": index_kb,
-        "index_built": index_age,
-        "last_maintenance": last_maint,
+        "index_built": index_age or "not built",
+        "last_maintenance": last_maint or "never",
         "type_breakdown": dict(
             type_counts.most_common(20)
         ),
+        "branch_distribution": dict(
+            branch_counts.most_common(10)
+        ),
+        "current_branch": get_current_branch(),
         "top_by_recall": [
             {"name": n, "recalls": c}
             for n, c in top_recall

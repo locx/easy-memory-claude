@@ -16,14 +16,21 @@ from .config import (
     RECALL_FLUSH_INTERVAL,
     SERVER_NAME,
     SERVER_VERSION,
+    init_branch,
+    refresh_branch,
+    log_event,
+    session_stats,
 )
 from .cache import index_cache
-from .graph import load_index, append_jsonl
+from .graph import (
+    load_index,
+    append_jsonl,
+    invalidate_entity_cache_only,
+    invalidate_relation_cache_only,
+)
 from .protocol import handle_message
 from . import recall as _recall_mod
 from .recall import flush_recall_counts
-
-from .logging import log_event, session_stats
 
 _shutdown_requested = False
 
@@ -97,6 +104,8 @@ def _merge_pending(memory_dir):
                     f"(lock timeout)",
                 )
                 return
+            invalidate_entity_cache_only()
+            invalidate_relation_cache_only()
             session_stats["pending_merged"] += len(entries)
             log_event(
                 "MERGE_PENDING",
@@ -140,6 +149,11 @@ def main():
                 f"could not be created: {exc}\n"
             )
         sys.stderr.flush()
+
+    # Initialize branch detection
+    # Convention: MEMORY_DIR is <project>/.memory
+    project_dir = os.path.dirname(memory_dir)
+    init_branch(project_dir)
 
     # atexit for recall persistence
     atexit.register(flush_recall_counts)
@@ -186,6 +200,14 @@ def main():
                 if (_now_mono - _recall_mod.recall_last_flush
                         > RECALL_FLUSH_INTERVAL):
                     flush_recall_counts()
+
+            # Refresh branch detection
+            branch, changed = refresh_branch()
+            if changed:
+                log_event(
+                    "BRANCH_SWITCH",
+                    f"now on {branch}",
+                )
 
             # --- Non-blocking stdin via select ---
             # Timeout allows periodic tasks to run

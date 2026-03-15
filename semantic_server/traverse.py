@@ -4,7 +4,7 @@ import os
 from .cache import (
     adjacency_cache,
     estimate_size,
-    maybe_evict_caches,
+    relation_cache,
 )
 from .graph import (
     get_graph_mtime,
@@ -20,7 +20,6 @@ _MAX_VISITED = 10_000
 def _get_adjacency(memory_dir):
     """Build or return cached adjacency dicts."""
     relations = load_graph_relations(memory_dir)
-    from .cache import relation_cache
     mtime = relation_cache.get("mtime", 0.0)
 
     if (adjacency_cache["outbound"] is not None
@@ -45,10 +44,8 @@ def _get_adjacency(memory_dir):
     adjacency_cache["inbound"] = inbound
     adjacency_cache["mtime"] = mtime
     adjacency_cache["size"] = (
-        estimate_size(outbound)
-        + estimate_size(inbound)
+        estimate_size(outbound) + estimate_size(inbound)
     )
-    maybe_evict_caches()
     return outbound, inbound
 
 

@@ -174,16 +174,11 @@ def main():
             print(warning_text)
 
     # --- Activity logging ---
-    if tool == 'Edit':
-        path = file_path or data.get(
-            'tool_input', {}
-        ).get('file_path', '?')
-        obs = f'Edited {os.path.basename(path)}'
-    elif tool == 'Write':
-        path = file_path or data.get(
-            'tool_input', {}
-        ).get('file_path', '?')
-        obs = f'Created/wrote {os.path.basename(path)}'
+    if tool in ('Edit', 'Write'):
+        base = os.path.basename(file_path or '?')
+        verb = 'Edited' if tool == 'Edit' \
+            else 'Created/wrote'
+        obs = f'{verb} {base}'
     elif tool == 'Bash':
         cmd = str(
             data.get('tool_input', {}).get('command', '')
@@ -244,6 +239,7 @@ def _write_direct(graph_path, entry):
             ) as f:
                 f.write(entry + '\n')
                 f.flush()
+                os.fsync(f.fileno())
         finally:
             if acquired:
                 try:

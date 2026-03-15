@@ -48,6 +48,35 @@ def _obs_dedup_key(obs):
     return json.dumps(obs, sort_keys=True)
 
 
+def _merge_obs(prev_obs, new_obs, seen=None):
+    """Merge new_obs into prev_obs with dedup + truncate."""
+    if seen is None:
+        seen = {_obs_dedup_key(o) for o in prev_obs}
+    for o in new_obs:
+        k = _obs_dedup_key(o)
+        if k not in seen:
+            prev_obs.append(o)
+            seen.add(k)
+    if len(prev_obs) > MAX_CACHED_OBS:
+        prev_obs[:] = prev_obs[-MAX_CACHED_OBS:]
+        seen = {_obs_dedup_key(o) for o in prev_obs}
+    return seen
+
+
+def _merge_ts(prev, created, updated):
+    """Keep earliest _created, latest _updated."""
+    if created and (
+        not prev.get("_created")
+        or created < prev["_created"]
+    ):
+        prev["_created"] = created
+    if updated and (
+        not prev.get("_updated")
+        or updated > prev["_updated"]
+    ):
+        prev["_updated"] = updated
+
+
 def get_graph_mtime(memory_dir):
     """Get graph.jsonl mtime, or None if missing."""
     graph_path = os.path.join(memory_dir, "graph.jsonl")
@@ -60,37 +89,26 @@ def get_graph_mtime(memory_dir):
 def _parse_graph_file(graph_path, start_offset=0):
     """Parse graph.jsonl into (entities_dict, relations_list).
 
-    Merges duplicate entity names (common from append-only
-    writes by capture-tool-context hook). Observations are
-    deduplicated, earliest _created and latest _updated kept.
-    Skips entities with empty name.
-
-    Observations are truncated to MAX_CACHED_OBS during
-    parse (not after) to reduce peak memory.
-
-    Supports start_offset for incremental reads. Aborts
-    after PARSE_TIME_BUDGET seconds.
+    Merges duplicate entity names, deduplicates observations,
+    keeps earliest _created and latest _updated.
+    Supports start_offset for incremental reads.
 
     Returns (entities, relations, end_offset).
     """
     entities = {}
     relations = []
+    _rel_seen = set()
     deadline = time.monotonic() + PARSE_TIME_BUDGET
     line_count = 0
     end_offset = start_offset
-    # Byte guard for incremental reads — cap at 2x
-    # typical append batch to catch corruption/runaway.
     max_incr_bytes = MAX_GRAPH_BYTES if start_offset == 0 \
         else min(MAX_GRAPH_BYTES, 10_000_000)
     try:
-        # Binary mode for correct byte-offset tracking
-        # (text-mode seek is undefined for non-tell values)
         with open(graph_path, "rb") as f:
             if start_offset > 0:
                 f.seek(start_offset)
             for raw in f:
                 end_offset = f.tell()
-                # Byte budget guard for incremental reads
                 if (end_offset - start_offset
                         > max_incr_bytes):
                     sys.stderr.write(
@@ -104,7 +122,6 @@ def _parse_graph_file(graph_path, start_offset=0):
                 line = line.strip()
                 if not line:
                     continue
-                # Time budget check every 1000 lines
                 line_count += 1
                 if line_count % 1000 == 0:
                     if time.monotonic() > deadline:
@@ -125,7 +142,6 @@ def _parse_graph_file(graph_path, start_offset=0):
                             name = name.strip()
                         if not name:
                             continue
-                        # Cap entity count to bound memory
                         if (name not in entities
                                 and len(entities)
                                 >= MAX_ENTITY_COUNT):
@@ -135,57 +151,31 @@ def _parse_graph_file(graph_path, start_offset=0):
                             obs = []
                         if name in entities:
                             prev = entities[name]
-                            prev_obs = prev.get(
-                                "observations", []
+                            prev["_obs_keys"] = _merge_obs(
+                                prev.get(
+                                    "observations", []
+                                ),
+                                obs,
+                                prev.get("_obs_keys"),
                             )
-                            seen = prev.get("_obs_keys")
-                            if seen is None:
-                                seen = set()
-                                for o in prev_obs:
-                                    seen.add(
-                                        _obs_dedup_key(o)
-                                    )
-                                prev["_obs_keys"] = seen
-                            for o in obs:
-                                k = _obs_dedup_key(o)
-                                if k not in seen:
-                                    prev_obs.append(o)
-                                    seen.add(k)
-                            # Truncate without rebuilding
-                            # the full set — keep last N
-                            # obs, rebuild only their keys.
-                            if len(prev_obs) > MAX_CACHED_OBS:
-                                kept = prev_obs[
-                                    -MAX_CACHED_OBS:
-                                ]
-                                prev["observations"] = kept
-                                # Rebuild only for kept
-                                # (N=3, so O(1) work)
-                                prev["_obs_keys"] = {
-                                    _obs_dedup_key(o)
-                                    for o in kept
-                                }
-                            new_c = _norm_ts(
-                                obj.get("_created", "")
+                            _merge_ts(
+                                prev,
+                                _norm_ts(
+                                    obj.get("_created", "")
+                                ),
+                                _norm_ts(
+                                    obj.get("_updated", "")
+                                ),
                             )
-                            if new_c and (
-                                not prev["_created"]
-                                or new_c < prev["_created"]
-                            ):
-                                prev["_created"] = new_c
-                            new_u = _norm_ts(
-                                obj.get("_updated", "")
-                            )
-                            if new_u and (
-                                not prev["_updated"]
-                                or new_u > prev["_updated"]
-                            ):
-                                prev["_updated"] = new_u
+                            # First-writer-wins: keep
+                            # creation branch, not last
                             branch = obj.get("_branch")
-                            if branch:
+                            if branch \
+                                    and not prev.get(
+                                        "_branch"
+                                    ):
                                 prev["_branch"] = branch
                         else:
-                            # Truncate immediately on insert
                             obs_list = list(obs)
                             if len(obs_list) > MAX_CACHED_OBS:
                                 obs_list = obs_list[
@@ -212,28 +202,28 @@ def _parse_graph_file(graph_path, start_offset=0):
                         r_to = obj.get("to", "")
                         if not r_from or not r_to:
                             continue
-                        relations.append({
-                            "from": r_from,
-                            "to": r_to,
-                            "relationType": obj.get(
-                                "relationType", ""
-                            ),
-                        })
+                        r_type = obj.get(
+                            "relationType", ""
+                        )
+                        rel_key = (r_from, r_to, r_type)
+                        if rel_key not in _rel_seen:
+                            _rel_seen.add(rel_key)
+                            relations.append({
+                                "from": r_from,
+                                "to": r_to,
+                                "relationType": r_type,
+                            })
                 except (json.JSONDecodeError, ValueError):
                     continue
     except OSError:
         return None, None, 0
-    # Strip internal dedup keys (obs already truncated)
     for info in entities.values():
         info.pop("_obs_keys", None)
     return entities, relations, end_offset
 
 
 def _do_full_parse(graph_path, mtime):
-    """Full graph parse — populates both entity+relation caches.
-
-    Returns (entities, relations) or ({}, []) on failure.
-    """
+    """Full graph parse — populates both caches."""
     entities, relations, offset = _parse_graph_file(graph_path)
     if entities is None:
         clear_entity_cache()
@@ -286,12 +276,7 @@ def load_index(memory_dir):
 
 
 def load_graph_entities(memory_dir):
-    """Load entity details with mtime-based caching.
-
-    Supports incremental reads — when only appends have
-    occurred since last full parse, reads only new bytes
-    from the tracked file offset.
-    """
+    """Load entities with mtime cache + incremental reads."""
     graph_path, mtime = get_graph_mtime(memory_dir)
     if mtime is None:
         clear_entity_cache()
@@ -313,57 +298,54 @@ def load_graph_entities(memory_dir):
             graph_path, start_offset=prev_offset
         )
         if new_ents is None:
-            # Incremental read failed — force full parse
             entity_cache["append_only"] = False
         else:
-            # Merge new into existing cache
             existing = entity_cache["data"]
             for name, info in new_ents.items():
                 if name in existing:
-                    # Merge observations
                     prev = existing[name]
-                    seen = {
-                        _obs_dedup_key(o)
-                        for o in prev["observations"]
-                    }
-                    for o in info.get("observations", []):
-                        k = _obs_dedup_key(o)
-                        if k not in seen:
-                            prev["observations"].append(o)
-                            seen.add(k)
-                    if len(prev["observations"]) > \
-                            MAX_CACHED_OBS:
-                        prev["observations"] = \
-                            prev["observations"][
-                                -MAX_CACHED_OBS:]
-                    new_u = info.get("_updated", "")
-                    if new_u and (
-                        not prev["_updated"]
-                        or new_u > prev["_updated"]
-                    ):
-                        prev["_updated"] = new_u
+                    _merge_obs(
+                        prev["observations"],
+                        info.get("observations", []),
+                    )
+                    _merge_ts(
+                        prev,
+                        info.get("_created", ""),
+                        info.get("_updated", ""),
+                    )
                 else:
                     existing[name] = info
-            # Merge new relations
-            if relation_cache["data"] is not None:
-                relation_cache["data"].extend(new_rels)
-                # Incremental size: add delta, not re-scan
-                relation_cache["size"] += (
-                    estimate_size(new_rels)
-                    if new_rels else 0
-                )
+            # Merge new relations (deduplicated)
+            if relation_cache["data"] is not None \
+                    and new_rels:
+                existing_keys = {
+                    (r["from"], r["to"],
+                     r.get("relationType", ""))
+                    for r in relation_cache["data"]
+                }
+                added = [
+                    r for r in new_rels
+                    if (r["from"], r["to"],
+                        r.get("relationType", ""))
+                    not in existing_keys
+                ]
+                if added:
+                    relation_cache["data"].extend(added)
+                    relation_cache["size"] += (
+                        estimate_size(added)
+                    )
             entity_cache["mtime"] = mtime
             entity_cache["offset"] = offset
-            # Incremental size: add delta for new entities
             entity_cache["size"] += (
                 estimate_size(new_ents)
                 if new_ents else 0
             )
             entity_cache["append_only"] = False
-            # Invalidate adjacency (relations changed)
+            if relation_cache["data"] is not None:
+                relation_cache["mtime"] = mtime
             adjacency_cache.update(
                 outbound=None, inbound=None,
-                mtime=0.0, size=0,
+                mtime=0.0,
             )
             maybe_evict_caches()
             return existing
@@ -393,12 +375,7 @@ def load_graph_relations(memory_dir):
 
 
 class GraphLock:
-    """Context manager for exclusive graph file locking.
-
-    Uses non-blocking flock with retry loop and timeout
-    (GRAPH_LOCK_TIMEOUT) instead of indefinite block.
-    Callers can check self.acquired to handle lock failure.
-    """
+    """Exclusive graph file lock with timeout."""
     __slots__ = ("_fd", "_path", "acquired")
 
     def __init__(self, memory_dir):
@@ -417,8 +394,6 @@ class GraphLock:
         except OSError:
             return self
         try:
-            # Exponential backoff with monotonic deadline
-            # to avoid float accumulation drift.
             delay = 0.01
             deadline = time.monotonic() + GRAPH_LOCK_TIMEOUT
             while time.monotonic() < deadline:
@@ -432,17 +407,14 @@ class GraphLock:
                 except (IOError, OSError):
                     time.sleep(delay)
                     delay = min(delay * 2, 0.5)
-            # Timeout — lock not acquired
             sys.stderr.write(
                 "warn: graph lock timeout after "
                 f"{GRAPH_LOCK_TIMEOUT}s\n"
             )
         except Exception:
-            # Ensure fd cleanup on unexpected exception
             self._fd.close()
             self._fd = None
             raise
-        # Timeout path — close fd, no lock acquired
         self._fd.close()
         self._fd = None
         return self
@@ -468,15 +440,10 @@ def invalidate_caches():
 
 
 def invalidate_entity_cache_only():
-    """Mark entity cache for incremental reload.
-
-    Sets append_only flag so next load_graph_entities() can
-    do an incremental read from the tracked offset instead
-    of a full reparse.
-    """
+    """Mark entity cache for incremental reload."""
     if entity_cache["data"] is not None:
         entity_cache["append_only"] = True
-        entity_cache["mtime"] = 0.0  # force reload
+        entity_cache["mtime"] = 0.0
     else:
         clear_entity_cache()
 
@@ -503,28 +470,17 @@ def check_graph_size(memory_dir):
 
 
 def append_jsonl(memory_dir, entries, do_fsync=True):
-    """Append JSONL lines directly — O(1) for new entries.
-
-    Uses file append mode instead of copying the entire graph.
-    Falls back to creating the file if it doesn't exist.
-    Locked to prevent concurrent writes from hooks/maintenance.
-
-    Returns False on lock timeout instead of writing without
-    lock.
-    """
+    """Append JSONL lines under lock. O(1) for new entries."""
     graph_path = os.path.join(memory_dir, "graph.jsonl")
     with GraphLock(memory_dir) as lock:
         if not lock.acquired:
             return False
-        # Pre-serialize outside file write to catch
-        # serialization errors before touching the file.
-        # Avoids partial writes from generator failures.
         lines = []
         for e in entries:
             try:
                 lines.append(_fast_dumps(e) + "\n")
             except (TypeError, ValueError, OverflowError):
-                continue  # skip unserializable entries
+                continue
         if not lines:
             return True
         with open(graph_path, "a", encoding="utf-8") as f:
@@ -536,14 +492,7 @@ def append_jsonl(memory_dir, entries, do_fsync=True):
 
 
 def rewrite_graph(memory_dir, entities_dict, relations):
-    """Rewrite entire graph from entities dict + relations.
-
-    entities_dict: {name: {entityType, observations, ...}}
-    relations: list of relation dicts
-    Preserves all metadata fields (_branch, _created, etc).
-    Locked + atomic (temp file + fsync + os.replace).
-    Uses writelines() with a generator for batched I/O.
-    """
+    """Atomic rewrite: temp file + fsync + os.replace."""
     graph_path = os.path.join(memory_dir, "graph.jsonl")
     tmp = graph_path + ".new"
 
@@ -567,8 +516,6 @@ def rewrite_graph(memory_dir, entities_dict, relations):
             except (TypeError, ValueError, OverflowError):
                 continue
 
-    # Write temp file OUTSIDE lock — reduces lock hold
-    # time from seconds to milliseconds (just the rename).
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.writelines(_lines())
@@ -581,7 +528,6 @@ def rewrite_graph(memory_dir, entities_dict, relations):
             pass
         raise
 
-    # Lock only for the atomic rename
     with GraphLock(memory_dir) as lock:
         if not lock.acquired:
             try:
