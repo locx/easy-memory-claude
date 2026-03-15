@@ -50,6 +50,6 @@ echo "This project does not have Claude memory set up."
 echo "To enable persistent knowledge graph memory, run:"
 echo "  '${SETUP_CMD}' '${CLAUDE_PROJECT_DIR}'"
 echo ""
-echo "This adds a .memory/ directory (gitignored) and configures MCP servers"
+echo "This adds a .memory/ directory (gitignored) with a CLI bridge"
 echo "for keyword + semantic search across conversations."
 exit 0

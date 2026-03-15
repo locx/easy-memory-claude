@@ -4,6 +4,11 @@
 
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] || exit 0
 
+# VSCode extension runs hooks but discards output — skip entirely
+[ -z "${VSCODE_PID:-}" ] && [ -z "${VSCODE_IPC_HOOK:-}" ] \
+    && [ "${TERM_PROGRAM:-}" != "vscode" ] \
+    || exit 0
+
 MEMORY_DIR="${CLAUDE_PROJECT_DIR}/.memory"
 
 # Skip if project has no memory setup

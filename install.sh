@@ -8,10 +8,16 @@
 # Layout after install:
 #   ~/.claude/memory/              Runtime scripts only
 #     maintenance.py               Decay/prune/consolidate/TF-IDF
-#     semantic_server.py           MCP server for semantic search
+#     semantic_server/             Package (used by CLI bridge)
+#     semantic_server.py           Compat shim for legacy configs
+#     memory-cli.py               CLI bridge for memory tools
 #   ~/.claude/hooks/               Global lifecycle hooks
 #     prime-memory.sh              SessionStart — maintenance + context
 #     capture-decisions.sh         Stop — persist decision reminder
+#     nudge-setup.sh               SessionStart — setup nudge
+#     capture-tool-context.sh      PostToolUse — observation capture
+#     capture_tool_context.py      PostToolUse — Python handler
+#     smart_recall.py              SessionStart — scored recall
 #   ~/.claude/settings.json        Updated with hook wiring
 #
 # Dev/install files stay in easy-memory-claude project:
@@ -98,12 +104,17 @@ cp -r "${SCRIPT_DIR}/semantic_server" "${MEMORY_DIR}/semantic_server"
 find "${MEMORY_DIR}/semantic_server" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 echo "  [ok] semantic_server/ → ${MEMORY_DIR}/"
 
-# Deploy backwards-compatible shim for existing .mcp.json configs
+# Deploy backwards-compatible shim for legacy .mcp.json configs
 cp "${SCRIPT_DIR}/semantic_server.py" "${MEMORY_DIR}/semantic_server.py"
 chmod +x "${MEMORY_DIR}/semantic_server.py"
 echo "  [ok] semantic_server.py (compat shim) → ${MEMORY_DIR}/"
 printf '%s' "${SCRIPT_DIR}" > "${MEMORY_DIR}/.source-dir"
 echo "  [ok] .source-dir → ${MEMORY_DIR}/"
+
+# Deploy CLI bridge (primary tool access for both CLI and VSCode)
+cp "${SCRIPT_DIR}/memory-cli.py" "${MEMORY_DIR}/memory-cli.py"
+chmod +x "${MEMORY_DIR}/memory-cli.py"
+echo "  [ok] memory-cli.py (CLI bridge) → ${MEMORY_DIR}/"
 
 # Optional: orjson for 3-10x faster graph I/O
 if python3 -c "import orjson" 2>/dev/null; then
@@ -270,13 +281,13 @@ echo ""
 echo "============================================================"
 echo "  Installation complete!"
 echo ""
-echo "  Runtime:       ~/.claude/memory/ (2 scripts)"
-echo "  Hooks:         ~/.claude/hooks/  (6 hooks)"
+echo "  Runtime:       ~/.claude/memory/ (4 files + semantic_server/)"
+echo "  Hooks:         ~/.claude/hooks/  (4 shell + 2 Python)"
 echo "  Settings:      ~/.claude/settings.json"
 echo "  Dev/source:    ${SCRIPT_DIR}/"
 echo ""
 echo "  To set up a project:"
 echo "    ${SCRIPT_DIR}/setup-project.sh /path/to/project"
 echo ""
-echo "  Then restart Claude Code to activate MCP servers."
+echo "  Then restart Claude Code to activate hooks."
 echo "============================================================"

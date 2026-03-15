@@ -6,6 +6,12 @@
 # Throttled: skips if last capture was <30s ago.
 
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] || exit 0
+
+# VSCode extension runs hooks but discards output — skip entirely
+[ -z "${VSCODE_PID:-}" ] && [ -z "${VSCODE_IPC_HOOK:-}" ] \
+    && [ "${TERM_PROGRAM:-}" != "vscode" ] \
+    || exit 0
+
 [ -d "${CLAUDE_PROJECT_DIR}/.memory" ] || exit 0
 [ -n "${CLAUDE_SESSION_ID:-}" ] || exit 0
 

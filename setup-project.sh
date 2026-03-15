@@ -2,7 +2,7 @@
 # Initialize a project for Claude memory infrastructure.
 # Usage: setup-project.sh [project_dir]
 #
-# Creates .memory/, registers MCP server, bootstraps graph.
+# Creates .memory/, removes legacy MCP configs, bootstraps graph.
 # Safe to re-run — skips existing files, merges configs.
 set -euo pipefail
 
@@ -61,134 +61,110 @@ else
     echo "  [skip] ${GRAPH_FILE} — already exists"
 fi
 
-# ---- 4. Register MCP server (.mcp.json — Claude Code CLI) ----
+# ---- 4. Remove memory MCP servers from .mcp.json ----
+# VSCode extension spawns MCP servers on session start, causing
+# multi-second delay with zero benefit (tools don't work).
+# CLI bridge in CLAUDE.md covers both CLI and VSCode.
 MCP_ROOT="${PROJECT_DIR}/.mcp.json"
-SEMANTIC_PKG="${CLAUDE_HOME}/memory"
-
-python3 - "${MCP_ROOT}" "${SEMANTIC_PKG}" "${MEMORY_DIR}" << 'PYEOF'
+if [ -f "${MCP_ROOT}" ]; then
+    python3 - "${MCP_ROOT}" << 'PYEOF'
 import json, sys, os
 
 mcp_path = sys.argv[1]
-pkg_dir = sys.argv[2]
-memory_dir = sys.argv[3]
-
-new_server = {
-    "command": "python3",
-    "args": ["-m", "semantic_server"],
-    "env": {"MEMORY_DIR": memory_dir, "PYTHONPATH": pkg_dir}
-}
-
-cfg = {}
-if os.path.exists(mcp_path):
-    try:
-        with open(mcp_path, encoding='utf-8') as f:
-            cfg = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        cfg = {}
-
-servers = cfg.setdefault('mcpServers', {})
-if 'memory' in servers:
-    print('  [skip] .mcp.json — memory server already present')
-    sys.exit(0)
-
-# Remove old npx-based memory server if present
-for key in list(servers.keys()):
-    s = servers[key]
-    if isinstance(s, dict):
-        cmd = s.get('command', '')
-        args = s.get('args', [])
-        if cmd == 'npx' and any(
-            'server-memory' in str(a) for a in args
-        ):
-            del servers[key]
-            print(f'  [removed] .mcp.json — old npx server "{key}"')
-
-servers['memory'] = new_server
-
-tmp = mcp_path + '.tmp'
 try:
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=2)
-        f.write('\n')
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, mcp_path)
-except BaseException:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    raise
-print('  [ok] .mcp.json — memory server registered')
-PYEOF
-
-# ---- 5. Register MCP server (.vscode/mcp.json — VS Code) ----
-mkdir -p "${VSCODE_DIR}"
-MCP_VSCODE="${VSCODE_DIR}/mcp.json"
-
-python3 - "${MCP_VSCODE}" << 'PYEOF'
-import json, sys, os
-
-mcp_path = sys.argv[1]
-
-new_server = {
-    "command": "python3",
-    "args": ["-m", "semantic_server"],
-    "env": {
-        "MEMORY_DIR": "${workspaceFolder}/.memory",
-        "PYTHONPATH": "${userHome}/.claude/memory"
-    }
-}
-
-cfg = {}
-if os.path.exists(mcp_path):
-    try:
-        with open(mcp_path, encoding='utf-8') as f:
-            cfg = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        cfg = {}
-
-servers = cfg.setdefault('servers', {})
-if 'memory' in servers:
-    print('  [skip] .vscode/mcp.json — memory server already present')
+    with open(mcp_path, encoding='utf-8') as f:
+        cfg = json.load(f)
+except (json.JSONDecodeError, ValueError, OSError):
     sys.exit(0)
 
-# Remove old npx-based servers
+servers = cfg.get('mcpServers', {})
+removed = []
 for key in list(servers.keys()):
     s = servers[key]
-    if isinstance(s, dict):
-        cmd = s.get('command', '')
-        args = s.get('args', [])
-        if cmd == 'npx' and any(
-            'server-memory' in str(a) for a in args
-        ):
-            del servers[key]
-            print(f'  [removed] .vscode/mcp.json — old npx server "{key}"')
-
-# Remove old separate semantic-search server (now unified)
-for key in ('memory-search', 'memory-semantic-search'):
-    if key in servers:
+    if not isinstance(s, dict):
+        continue
+    env = s.get('env', {})
+    args = s.get('args', [])
+    cmd = s.get('command', '')
+    if ('MEMORY_DIR' in env or 'semantic_server' in str(args)
+            or (cmd == 'npx' and 'server-memory' in str(args))
+            or key in ('memory', 'memory-search',
+                       'memory-semantic-search')):
+        removed.append(key)
         del servers[key]
-        print(f'  [merged] .vscode/mcp.json — removed separate "{key}" (now unified in "memory")')
 
-servers['memory'] = new_server
+if not removed:
+    print('  [skip] .mcp.json — no memory servers to remove')
+    sys.exit(0)
 
-tmp = mcp_path + '.tmp'
-try:
+if servers:
+    tmp = mcp_path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2)
         f.write('\n')
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, mcp_path)
-except BaseException:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    raise
-print('  [ok] .vscode/mcp.json — memory server registered')
+else:
+    os.unlink(mcp_path)
+
+for k in removed:
+    print(f'  [removed] .mcp.json — "{k}" (causes VSCode startup delay)')
 PYEOF
+else
+    echo "  [skip] .mcp.json — not present"
+fi
+
+# ---- 5. Remove .vscode/mcp.json memory server if present ----
+# VSCode extension spawns MCP servers on session start even though
+# it can't use the tools (known bug). This adds seconds of delay.
+# CLAUDE.md CLI bridge covers both CLI and VSCode.
+MCP_VSCODE="${VSCODE_DIR}/mcp.json"
+if [ -f "${MCP_VSCODE}" ]; then
+    python3 - "${MCP_VSCODE}" << 'PYEOF'
+import json, sys, os
+
+mcp_path = sys.argv[1]
+try:
+    with open(mcp_path, encoding='utf-8') as f:
+        cfg = json.load(f)
+except (json.JSONDecodeError, ValueError, OSError):
+    sys.exit(0)
+
+servers = cfg.get('servers', {})
+removed = []
+for key in list(servers.keys()):
+    s = servers[key]
+    if not isinstance(s, dict):
+        continue
+    env = s.get('env', {})
+    args = s.get('args', [])
+    if ('MEMORY_DIR' in env or 'semantic_server' in str(args)
+            or key in ('memory', 'memory-search',
+                       'memory-semantic-search')):
+        removed.append(key)
+        del servers[key]
+
+if not removed:
+    sys.exit(0)
+
+if servers:
+    tmp = mcp_path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, mcp_path)
+else:
+    os.unlink(mcp_path)
+
+for k in removed:
+    print(f'  [removed] .vscode/mcp.json — "{k}" (causes startup delay)')
+PYEOF
+else
+    echo "  [skip] .vscode/mcp.json — not present"
+fi
 
 # ---- 6. Add .memory/ to .gitignore ----
 if [ -f "${GITIGNORE}" ]; then
@@ -382,19 +358,79 @@ else
     echo "  [skip] Graph already has data — skipping bootstrap"
 fi
 
+# ---- 8. Add/update memory plugin instructions in CLAUDE.md ----
+CLAUDE_MD="${PROJECT_DIR}/CLAUDE.md"
+MEMORY_MARKER="## Memory Graph Plugin"
+
+MEMORY_SECTION='
+## Memory Graph Plugin
+
+Knowledge graph at `.memory/`. All tools via Bash CLI bridge. Inline this full prefix in every Bash call (shell state does not persist between calls):
+
+    MEMORY_DIR=$PWD/.memory PYTHONPATH=~/.claude/memory python3 ~/.claude/memory/memory-cli.py
+
+Tools: graph_stats, semantic_search_memory, create_decision, update_decision_outcome, create_entities, create_relations, add_observations, delete_entities, traverse_relations, search_memory_by_time
+
+**Mandatory behavior — do silently, never ask permission:**
+- Before editing unfamiliar code → run `semantic_search_memory` for prior context
+- After choosing between approaches → run `create_decision` with title, rationale, scope
+- When finding fragile/surprising code → run `create_entities` with entityType `file-warning`
+- After revisiting a prior decision → run `update_decision_outcome` with lesson learned
+- After creating related entities → run `create_relations` to link them
+
+These are autonomous actions like reading a file before editing it. Never ask "want me to record this?" — just do it.'
+
+if [ ! -f "${CLAUDE_MD}" ]; then
+    echo "  [skip] No CLAUDE.md found — memory instructions not added"
+    echo "         Create a CLAUDE.md and re-run, or add manually"
+elif grep -q "${MEMORY_MARKER}" "${CLAUDE_MD}" 2>/dev/null; then
+    # Replace existing section: strip old, append new
+    python3 - "${CLAUDE_MD}" << 'PYEOF'
+import sys
+
+path = sys.argv[1]
+marker = "## Memory Graph Plugin"
+with open(path, encoding="utf-8") as f:
+    content = f.read()
+
+start = content.find(marker)
+if start < 0:
+    sys.exit(0)
+
+# Find end: next ## heading or EOF
+end = content.find("\n## ", start + len(marker))
+if end < 0:
+    old_section = content[start:]
+else:
+    old_section = content[start:end]
+
+content = content.replace(old_section, "").rstrip() + "\n"
+
+import os
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(content)
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(tmp, path)
+PYEOF
+    printf '%s\n' "$MEMORY_SECTION" >> "${CLAUDE_MD}"
+    echo "  [ok] Upgraded memory plugin section in CLAUDE.md"
+else
+    printf '%s\n' "$MEMORY_SECTION" >> "${CLAUDE_MD}"
+    echo "  [ok] Added memory plugin section to CLAUDE.md"
+fi
+
 echo ""
 echo "============================================================"
 echo "  Setup complete: ${PROJECT_NAME}"
 echo ""
 echo "  Graph:    ${GRAPH_FILE}"
-echo "  MCP CLI:  ${MCP_ROOT}"
-echo "  MCP VSC:  ${MCP_VSCODE}"
+echo "  Access:   CLI bridge (Bash) — works in both CLI and VSCode"
 echo ""
-echo "  10 MCP tools available (read + write + intelligence):"
+echo "  10 tools available:"
 echo "    semantic_search_memory, traverse_relations,"
 echo "    search_memory_by_time, create_entities,"
 echo "    create_relations, add_observations, delete_entities,"
 echo "    create_decision, update_decision_outcome, graph_stats"
-echo ""
-echo "  Restart Claude Code to activate the MCP server."
 echo "============================================================"

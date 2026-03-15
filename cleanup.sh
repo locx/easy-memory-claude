@@ -288,7 +288,50 @@ PYEOF
         fi
     fi
 
-    # 5. Clean up temp nudge marker for this specific project
+    # 5. Remove Memory Graph Plugin section from CLAUDE.md
+    if [ -f "${dir}/CLAUDE.md" ]; then
+        if grep -q '## Memory Graph Plugin' "${dir}/CLAUDE.md" 2>/dev/null; then
+            if $DRY_RUN; then
+                echo "  [dry-run] Would remove Memory Graph Plugin section from CLAUDE.md"
+            elif confirm "Remove Memory Graph Plugin section from CLAUDE.md?"; then
+                python3 - "${dir}/CLAUDE.md" << 'PYEOF'
+import sys, os
+
+path = sys.argv[1]
+marker = "## Memory Graph Plugin"
+with open(path, encoding="utf-8") as f:
+    content = f.read()
+
+start = content.find(marker)
+if start < 0:
+    sys.exit(0)
+
+# Find end: next ## heading or EOF
+end = content.find("\n## ", start + len(marker))
+if end < 0:
+    old_section = content[start:]
+else:
+    old_section = content[start:end]
+
+content = content.replace(old_section, "").rstrip() + "\n"
+
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(content)
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(tmp, path)
+print('  \033[0;32m[removed]\033[0m Memory Graph Plugin section from CLAUDE.md')
+PYEOF
+            fi
+        else
+            echo "  [skip] CLAUDE.md — no Memory Graph Plugin section"
+        fi
+    else
+        echo "  [skip] CLAUDE.md — not found"
+    fi
+
+    # 6. Clean up temp nudge marker for this specific project
     if ! $DRY_RUN; then
         # Compute same hash as nudge-setup.sh
         _proj_hash=""
