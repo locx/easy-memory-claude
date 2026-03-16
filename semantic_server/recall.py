@@ -1,8 +1,7 @@
 """Recall tracking — Hebbian reinforcement for search results.
 
-Tracks how often entities are recalled (returned in search results)
-and uses that signal to boost relevance scoring. Uses an OrderedDict
-for O(1) LRU eviction when the entry count exceeds the cap.
+Tracks entity recall frequency to boost relevance scoring.
+OrderedDict for O(1) LRU eviction.
 """
 import json
 import os
@@ -15,16 +14,15 @@ from .config import (
     RECALL_FLUSH_INTERVAL,
 )
 
-# OrderedDict for O(1) LRU eviction
-recall_counts = OrderedDict()  # entity_name -> count
-recall_dirty = False       # True when counts changed since flush
-recall_last_flush = 0.0    # monotonic ts of last flush
-recall_path = ""           # set on first search
-recall_mtime = 0.0         # track file mtime
-_last_recall_check = 0.0   # monotonic timestamp of last check
+recall_counts = OrderedDict()
+recall_dirty = False
+recall_last_flush = 0.0
+recall_path = ""
+recall_mtime = 0.0
+_last_recall_check = 0.0
 
 
-def load_recall_counts(memory_dir):
+def init_recall_state(memory_dir):
     """Load recall counts from sidecar file."""
     global recall_counts, recall_path, recall_mtime
     recall_path = os.path.join(
@@ -46,11 +44,7 @@ def load_recall_counts(memory_dir):
 
 
 def maybe_reload_recall_counts():
-    """Reload recall counts if file changed on disk.
-
-    Throttled to one stat() call per RECALL_CHECK_INTERVAL
-    seconds to reduce syscall overhead on rapid searches.
-    """
+    """Reload if file changed (throttled to 1 stat/interval)."""
     global recall_mtime, _last_recall_check
     if not recall_path:
         return
@@ -76,36 +70,26 @@ def maybe_reload_recall_counts():
                 cur = recall_counts.get(k, 0)
                 if v > cur:
                     recall_counts[k] = v
-        # Update mtime only after successful read
         recall_mtime = mtime
     except (OSError, json.JSONDecodeError, ValueError):
         pass
 
 
 def record_recalls(entity_names):
-    """Increment recall counts (no I/O — flush is deferred).
-
-    Uses OrderedDict for O(1) LRU eviction.
-    Caller is responsible for flushing between requests.
-    """
+    """Increment recall counts (no I/O — flush is deferred)."""
     global recall_dirty
     for name in entity_names:
         recall_counts[name] = (
             recall_counts.get(name, 0) + 1
         )
         recall_counts.move_to_end(name)
-    # LRU eviction: pop oldest (least-recently-used) O(1)
     while len(recall_counts) > MAX_RECALL_ENTRIES:
         recall_counts.popitem(last=False)
     recall_dirty = True
 
 
 def flush_recall_counts():
-    """Atomic write of recall counts to disk.
-
-    Skips fsync — recall counts are non-critical data
-    that can be regenerated.
-    """
+    """Atomic write of recall counts to disk (no fsync — non-critical)."""
     global recall_dirty, recall_last_flush, recall_mtime
     if not recall_path:
         recall_dirty = False
@@ -122,7 +106,6 @@ def flush_recall_counts():
             )
             f.flush()
         os.replace(tmp, recall_path)
-        # Only clear dirty after successful write+replace
         recall_dirty = False
         try:
             recall_mtime = os.path.getmtime(recall_path)

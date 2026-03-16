@@ -57,7 +57,7 @@
   },
   {
     "name": "search_memory_by_time",
-    "description": "Search memory entities by time range. Returns entities updated/created within the window, sorted by most recent first.",
+    "description": "Search memory entities by time range. Returns entities updated/created within the window, sorted by most recent first. Optionally filter by entity type.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -77,6 +77,10 @@
         "branch_filter": {
           "type": "string",
           "description": "Filter to entities from this branch only"
+        },
+        "entity_type": {
+          "type": "string",
+          "description": "Filter to entities of this type (e.g. Decision, Module, Pattern)"
         }
       }
     }
@@ -185,6 +189,30 @@
     }
   },
   {
+    "name": "remove_observations",
+    "description": "Remove specific observations from an existing entity. Non-matching observations are silently ignored.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entity": {
+          "type": "string",
+          "description": "Entity name"
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Observations to remove (exact match)"
+        }
+      },
+      "required": [
+        "entity",
+        "observations"
+      ]
+    }
+  },
+  {
     "name": "delete_entities",
     "description": "Delete entities by name. Relations involving deleted entities are cascade-removed.",
     "inputSchema": {
@@ -204,6 +232,27 @@
     }
   },
   {
+    "name": "rename_entity",
+    "description": "Rename an entity and update all relation references (from/to) to use the new name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "old_name": {
+          "type": "string",
+          "description": "Current entity name"
+        },
+        "new_name": {
+          "type": "string",
+          "description": "New entity name"
+        }
+      },
+      "required": [
+        "old_name",
+        "new_name"
+      ]
+    }
+  },
+  {
     "name": "create_decision",
     "description": "Record an architectural or design decision with structured rationale, rejected alternatives, and outcome tracking. Use this when the session involved choosing between approaches, evaluating trade-offs, or making scoping decisions.",
     "inputSchema": {
@@ -216,6 +265,10 @@
         "rationale": {
           "type": "string",
           "description": "Why this approach was chosen"
+        },
+        "chosen": {
+          "type": "string",
+          "description": "The approach/option that was chosen"
         },
         "alternatives": {
           "type": "array",
@@ -290,8 +343,24 @@
     }
   },
   {
+    "name": "list_decisions",
+    "description": "List all recorded decisions with their status, sorted by most recent first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
     "name": "graph_stats",
     "description": "Return graph health statistics: entity/relation counts, type breakdown, branch distribution, index age, recall rankings, pending decisions, and current session activity counters.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "rebuild_index",
+    "description": "Force rebuild the TF-IDF search index. Normally built automatically by the SessionStart maintenance hook once per day.",
     "inputSchema": {
       "type": "object",
       "properties": {}

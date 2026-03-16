@@ -1,7 +1,6 @@
-"""Constants, limits, patterns, and event logging for the MCP server.
+"""Constants, limits, patterns, and event logging.
 
-Logging lives here (not in a separate module) because config.py
-imports nothing from the package — safe anchor for all modules.
+Safe anchor for all modules — imports nothing from the package.
 """
 import os
 import re
@@ -12,28 +11,27 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memory-semantic-search"
 SERVER_VERSION = "3.0.0"
 
-MAX_INPUT_CHARS = 10_000_000  # 10 MB — reject oversized lines
-MAX_TOP_K = 100               # cap result count
-MAX_QUERY_CHARS = 10_000      # cap query length
-MAX_RECALL_ENTRIES = 10_000   # cap recall dict size
-MAX_ENTITY_COUNT = 100_000    # cap parsed entity count
-MAX_CANDIDATES = 1000         # cap search candidate set
-MAX_CACHE_BYTES = 50_000_000  # 50 MB combined cache cap
+MAX_INPUT_CHARS = 10_000_000
+MAX_TOP_K = 100
+MAX_QUERY_CHARS = 10_000
+MAX_RECALL_ENTRIES = 10_000
+MAX_ENTITY_COUNT = 100_000
+MAX_CANDIDATES = 1000
+MAX_CACHE_BYTES = 50_000_000
 
-RECALL_CHECK_INTERVAL = 60    # seconds between recall mtime checks
-RECALL_FLUSH_INTERVAL = 60    # seconds between recall flushes
-GRAPH_LOCK_TIMEOUT = 5.0      # seconds before lock acquisition fails
-PARSE_TIME_BUDGET = 10.0      # max seconds for graph file parse
-INDEX_CHECK_INTERVAL = 5.0    # seconds between stat() checks
+RECALL_CHECK_INTERVAL = 60
+RECALL_FLUSH_INTERVAL = 60
+GRAPH_LOCK_TIMEOUT = 5.0
+PARSE_TIME_BUDGET = 10.0
+INDEX_CHECK_INTERVAL = 5.0
 
 MAX_ENTITIES_PER_CALL = 50
 MAX_RELATIONS_PER_CALL = 100
 MAX_OBS_PER_CALL = 50
 MAX_OBS_LENGTH = 5000
-MAX_GRAPH_BYTES = 50_000_000  # 50 MB write guard
-MAX_CACHED_OBS = 3            # obs kept per entity in read cache
+MAX_GRAPH_BYTES = 50_000_000
+MAX_CACHED_OBS = 3
 
-# Pre-compiled regex
 RE_WORDS = re.compile(r'\w+')
 
 
@@ -45,21 +43,17 @@ def now_iso():
 def normalize_iso_ts(ts):
     """Normalize ISO timestamp for safe lexicographic sort.
 
-    Canonical implementation — imported by graph.py and
-    search.py. Fast path for well-formed timestamps
-    (>99% case).
+    Fast path for well-formed timestamps (>99% case).
     """
     if not ts or not isinstance(ts, str):
         return ""
     if (len(ts) >= 10 and ts[4] == '-' and ts[7] == '-'
             and ts[:4].isdigit() and ts[5:7].isdigit()
             and ts[8:10].isdigit()):
-        # Validate month (01-12) and day (01-31) bounds
         month = int(ts[5:7])
         day = int(ts[8:10])
         if 1 <= month <= 12 and 1 <= day <= 31:
             return ts
-        # Fall through to normalization path
     try:
         parts = ts.split('T', 1)
         dp = parts[0].split('-')
@@ -77,7 +71,7 @@ def normalize_iso_ts(ts):
     return ts
 
 
-# --- Event logging and session stats ---
+# --- Event logging ---
 
 session_stats = {
     "searches": 0,
@@ -97,11 +91,7 @@ def reset_session_stats():
 
 
 def log_event(event_type, details=""):
-    """Emit structured event to stderr for user visibility.
-
-    Format: [memory] EVENT_TYPE details
-    All MCP server logs go to stderr (stdout is JSON-RPC).
-    """
+    """Emit [memory] EVENT_TYPE details to stderr."""
     try:
         sys.stderr.write(
             f"[memory] {event_type} {details}\n"
@@ -124,7 +114,7 @@ _project_dir = ""
 
 
 def _read_git_head(project_dir):
-    """Read branch from .git/HEAD. <0.1ms file read."""
+    """Read branch from .git/HEAD (<0.1ms)."""
     git_head = os.path.join(project_dir, ".git", "HEAD")
     try:
         with open(git_head) as f:
@@ -133,7 +123,6 @@ def _read_git_head(project_dir):
             return content[16:]
         if content.startswith("ref: "):
             return content[5:].rsplit("/", 1)[-1]
-        # Detached HEAD — short SHA
         if len(content) >= 8:
             return content[:12]
         return ""
@@ -142,7 +131,7 @@ def _read_git_head(project_dir):
 
 
 def init_branch(project_dir):
-    """Seed branch state at startup. Call once."""
+    """Seed branch state at startup."""
     global _project_dir, _current_branch
     global _branch_check_mono
     _project_dir = project_dir
@@ -153,10 +142,7 @@ def init_branch(project_dir):
 
 
 def refresh_branch():
-    """Re-read branch if interval expired.
-
-    Returns (branch, changed). Safe to call every loop.
-    """
+    """Re-read branch if interval expired. Returns (branch, changed)."""
     global _current_branch, _branch_check_mono
     now = time.monotonic()
     if now - _branch_check_mono < _BRANCH_CHECK_INTERVAL:

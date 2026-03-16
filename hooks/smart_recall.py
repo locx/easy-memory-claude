@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """Smart recall: score-ranked entity summary for SessionStart.
 
-Top-N entities ranked by obs_count * recency * recall_boost,
-with inline 1-hop relations. Surfaces pending decisions and
-graph stats. CLI-only (hooks don't fire in VSCode — CLAUDE.md
-handles that path).
-
 Standalone — no dependency on semantic_server package.
-
 Usage: python3 smart_recall.py <memory_dir>
 """
 import json
@@ -53,7 +47,7 @@ def _parse_iso_days_ago(ts, now_ts):
         return 999
 
 
-def _load_recall_counts(memory_dir):
+def _read_recall_counts(memory_dir):
     """Load recall frequency counts."""
     rc_path = os.path.join(memory_dir, "recall_counts.json")
     try:
@@ -250,10 +244,9 @@ def main():
         print("Memory graph is empty.")
         return
 
-    recall_counts = _load_recall_counts(memory_dir)
+    recall_counts = _read_recall_counts(memory_dir)
     now_ts = time.time()
 
-    # Score entities
     scored = []
     type_counts = defaultdict(int)
     for name, info in entities.items():
@@ -271,7 +264,6 @@ def main():
     scored.sort(reverse=True)
     adj = _build_adjacency(relations)
 
-    # Stats line
     n_ent = len(entities)
     n_rel = len(relations)
     n_dec = type_counts.get("decision", 0)
@@ -283,7 +275,6 @@ def main():
            if current_branch else "")
     )
 
-    # Top 5
     top_n = min(5, len(scored))
     for _, name, info in scored[:top_n]:
         etype = info.get("entityType", "")
@@ -294,7 +285,6 @@ def main():
         tag = f" ({etype})" if etype else ""
         print(f"  {name}{tag}: {best_obs}{rels}")
 
-    # Pending decisions
     for name, info in entities.items():
         if info.get("entityType") != "decision":
             continue
@@ -309,10 +299,9 @@ def main():
                 display = display[10:]
             print(f"  [pending] {display}")
 
-    # Tools reminder (CLI mode only — this hook
-    # doesn't fire in VSCode)
     print(
         "Tools: semantic_search_memory | "
+        "traverse_relations | create_entities | "
         "create_decision | graph_stats"
     )
 

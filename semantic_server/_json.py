@@ -1,15 +1,8 @@
-"""Optional fast JSON backend.
+"""Optional fast JSON backend: orjson -> stdlib json.
 
-Tries orjson (fastest) -> stdlib json.
-Import: from ._json import loads, dumps, dump, load
-
-All backends normalize parse errors to ValueError so
-callers can use a single except clause. This is critical
-because orjson.JSONDecodeError is NOT a subclass of
-json.JSONDecodeError — without normalization, catch
-blocks miss parse errors when orjson is active.
-
-Zero-dependency fallback guaranteed.
+Normalizes parse errors to ValueError so callers can use
+a single except clause (orjson.JSONDecodeError is NOT a
+subclass of json.JSONDecodeError).
 """
 
 try:
@@ -22,7 +15,6 @@ try:
             raise ValueError(str(exc)) from exc
 
     def dumps(obj, separators=None):
-        # orjson always uses compact separators
         return _orjson.dumps(obj).decode("utf-8")
 
     def dump(obj, f, separators=None):

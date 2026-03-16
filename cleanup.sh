@@ -1,16 +1,8 @@
 #!/bin/bash
-# ============================================================
-# easy-memory-claude — Cleanup Utility
-# ============================================================
-# Removes all easy-memory-claude artifacts for a fresh start.
-#
-# Modes:
-#   cleanup.sh project [dir]   Remove per-project memory data
-#   cleanup.sh global          Remove global runtime + hooks
-#   cleanup.sh all [dir]       Remove everything (global + project)
-#
+# Cleanup utility — removes easy-memory-claude artifacts.
+# Modes: project [dir] | global | all [dir]
+# Options: --yes (skip prompts), --dry-run
 # Safe: prompts before each destructive step unless --yes flag.
-# ============================================================
 set -euo pipefail
 
 CLAUDE_HOME="${HOME}/.claude"
@@ -35,7 +27,7 @@ usage() {
     exit 1
 }
 
-# --- Parse args ---
+# --- Parse arguments ---
 MODE=""
 PROJECT_DIR=""
 AUTO_YES=false
@@ -61,6 +53,7 @@ done
 
 [ -z "$MODE" ] && usage
 
+# Resolve project directory to absolute path
 if [ "$MODE" = "project" ] || [ "$MODE" = "all" ]; then
     PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
     PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd)" || {
@@ -96,9 +89,9 @@ remove_path() {
     fi
 }
 
-# ============================================================
-# Project cleanup
-# ============================================================
+# --- Project cleanup ---
+# Steps: 1) .memory/ dir  2) .mcp.json servers  3) .vscode/mcp.json servers
+#        4) .gitignore entries  5) CLAUDE.md plugin section  6) temp markers
 cleanup_project() {
     local dir="$1"
     echo ""
@@ -118,7 +111,7 @@ cleanup_project() {
         echo "  [skip] .memory/ — not found"
     fi
 
-    # 2. Remove memory entry from .mcp.json
+    # 2. Remove memory server entries from .mcp.json
     if [ -f "${dir}/.mcp.json" ]; then
         python3 - "${dir}/.mcp.json" "$DRY_RUN" << 'PYEOF'
 import json, sys, os
@@ -180,7 +173,7 @@ PYEOF
         echo "  [skip] .mcp.json — not found"
     fi
 
-    # 3. Remove memory entry from .vscode/mcp.json
+    # 3. Remove memory server entries from .vscode/mcp.json
     if [ -f "${dir}/.vscode/mcp.json" ]; then
         python3 - "${dir}/.vscode/mcp.json" "$DRY_RUN" << 'PYEOF'
 import json, sys, os
@@ -246,13 +239,13 @@ PYEOF
         echo "  [skip] .vscode/mcp.json — not found"
     fi
 
-    # 4. Remove .memory/ from .gitignore
+    # 4. Remove .memory/ lines from .gitignore
     if [ -f "${dir}/.gitignore" ]; then
         if grep -q '\.memory/' "${dir}/.gitignore" 2>/dev/null; then
             if $DRY_RUN; then
                 echo "  [dry-run] Would remove .memory/ lines from .gitignore"
             else
-                # Remove the .memory/ line and preceding comment if it's "# Memory"
+                # Remove .memory/ line and preceding "# Memory" comment
                 python3 - "${dir}/.gitignore" << 'PYEOF'
 import sys
 
@@ -268,7 +261,6 @@ for i, line in enumerate(lines):
         # Also remove preceding "# Memory" comment
         if out and out[-1].strip() == '# Memory':
             out.pop()
-        # Remove trailing blank line if it was preceded by blank
         continue
     out.append(line)
 
@@ -331,7 +323,7 @@ PYEOF
         echo "  [skip] CLAUDE.md — not found"
     fi
 
-    # 6. Clean up temp nudge marker for this specific project
+    # 6. Clear temp nudge marker for this project
     if ! $DRY_RUN; then
         # Compute same hash as nudge-setup.sh
         _proj_hash=""
@@ -346,14 +338,14 @@ PYEOF
     fi
 }
 
-# ============================================================
-# Global cleanup
-# ============================================================
+# --- Global cleanup ---
+# Steps: 1) ~/.claude/memory/  2) hook scripts  3) settings.json hook wiring
+#        4) temp markers
 cleanup_global() {
     echo ""
     printf "${RED}=== Global Cleanup ===${NC}\n"
 
-    # 1. Remove ~/.claude/memory/
+    # 1. Remove ~/.claude/memory/ runtime directory
     if [ -d "${CLAUDE_HOME}/memory" ]; then
         echo "  Found ~/.claude/memory/"
         if confirm "Delete ${CLAUDE_HOME}/memory/ ?"; then
@@ -363,7 +355,7 @@ cleanup_global() {
         echo "  [skip] ~/.claude/memory/ — not found"
     fi
 
-    # 2. Remove hooks
+    # 2. Remove deployed hook scripts
     HOOKS=(prime-memory.sh capture-decisions.sh nudge-setup.sh capture-tool-context.sh capture_tool_context.py smart_recall.py)
     for hook in "${HOOKS[@]}"; do
         remove_path "${CLAUDE_HOME}/hooks/${hook}" "~/.claude/hooks/${hook}"
@@ -375,7 +367,7 @@ cleanup_global() {
         fi
     fi
 
-    # 3. Remove hook wiring from settings.json
+    # 3. Remove memory hook wiring from settings.json
     if [ -f "${CLAUDE_HOME}/settings.json" ]; then
         python3 - "${CLAUDE_HOME}/settings.json" "$DRY_RUN" << 'PYEOF'
 import json, sys
@@ -456,9 +448,7 @@ PYEOF
     fi
 }
 
-# ============================================================
-# Execute
-# ============================================================
+# --- Execute ---
 case "$MODE" in
     project)
         cleanup_project "$PROJECT_DIR"

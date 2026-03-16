@@ -4,7 +4,6 @@ Includes: create, update, delete entities/relations,
 create_decision, update_decision_outcome, graph_stats.
 """
 import os
-import sys
 import time
 from collections import Counter
 
@@ -32,15 +31,10 @@ from .graph import (
 )
 
 _DECISION_PREFIX = "decision: "
-_DECISION_PREFIX_LEN = len(_DECISION_PREFIX)
 
 
 def create_entities(entities_input, memory_dir):
-    """Create entities via append-only write.
-
-    Returns error dict on lock timeout instead of
-    silently losing data.
-    """
+    """Create entities via append-only write."""
     if not isinstance(entities_input, list):
         return {"error": "entities must be a list"}
     if len(entities_input) > MAX_ENTITIES_PER_CALL:
@@ -109,10 +103,7 @@ def create_entities(entities_input, memory_dir):
 
 
 def create_relations(relations_input, memory_dir):
-    """Create relations via append-only write.
-
-    Returns error on lock timeout.
-    """
+    """Create relations via append-only write."""
     if not isinstance(relations_input, list):
         return {"error": "relations must be a list"}
     if len(relations_input) > MAX_RELATIONS_PER_CALL:
@@ -205,11 +196,8 @@ def add_observations(entity_name, observations,
 
     now = now_iso()
 
-    # Always load via load_graph_entities — respects
-    # mtime/append_only flags for cache coherence.
-    # Direct entity_cache["data"] read caused false
-    # "not found" after create_entities in same session
-    # (stale cache, append_only flag not honored).
+    # Must use load_graph_entities (not raw cache) for
+    # cache coherence after create_entities in same session
     cached = load_graph_entities(memory_dir)
     if entity_name not in cached:
         return {
@@ -262,13 +250,11 @@ def delete_entities(entity_names, memory_dir,
                     _retry=False):
     """Delete entities and cascade-remove relations.
 
-    Uses mtime guard to detect concurrent writes between
-    load and rewrite — retries once with fresh data.
+    Mtime guard detects concurrent writes — retries once.
     """
     if not isinstance(entity_names, list):
         return {"error": "entity_names must be a list"}
 
-    # Capture mtime before loading
     graph_path = os.path.join(memory_dir, "graph.jsonl")
     try:
         pre_mtime = os.path.getmtime(graph_path)
@@ -298,7 +284,6 @@ def delete_entities(entity_names, memory_dir,
         and r.get("to") not in to_delete
     ]
 
-    # Check for concurrent modification before rewrite
     try:
         post_mtime = os.path.getmtime(graph_path)
     except OSError:
@@ -332,16 +317,8 @@ def delete_entities(entity_names, memory_dir,
     }
 
 
-# --- Intelligence tools ---
-
-
 def create_decision(args, memory_dir):
-    """Create a structured decision entity.
-
-    Wraps create_entities with decision-specific schema:
-    title, rationale, alternatives, scope, outcome.
-    Auto-creates relations to related_entities.
-    """
+    """Create a structured decision entity with relations."""
     if not isinstance(args, dict):
         return {"error": "arguments must be a dict"}
 
@@ -369,6 +346,10 @@ def create_decision(args, memory_dir):
         obs.append(
             f"Scope: {scope[:MAX_OBS_LENGTH]}"
         )
+
+    chosen = args.get("chosen", "")
+    if isinstance(chosen, str) and chosen.strip():
+        obs.append(f"Chosen: {chosen[:MAX_OBS_LENGTH]}")
 
     outcome = args.get("outcome", "pending")
     if outcome not in (
@@ -426,11 +407,7 @@ def create_decision(args, memory_dir):
 
 
 def update_decision_outcome(args, memory_dir):
-    """Update a decision's outcome and record lesson.
-
-    Tries both with and without 'decision: ' prefix
-    to find the entity.
-    """
+    """Update a decision's outcome and record lesson."""
     if not isinstance(args, dict):
         return {"error": "arguments must be a dict"}
 
@@ -466,7 +443,6 @@ def update_decision_outcome(args, memory_dir):
             f"Lesson: {lesson[:MAX_OBS_LENGTH]}"
         )
 
-    # Try each candidate name
     for entity_name in candidates:
         result = add_observations(
             entity_name, new_obs, memory_dir
@@ -580,3 +556,117 @@ def graph_stats(memory_dir):
         f"{n_pending} pending decisions",
     )
     return result
+
+
+def list_decisions(memory_dir):
+    """List all decisions with status."""
+    entities = load_graph_entities(memory_dir)
+    decisions = []
+    for name, info in entities.items():
+        if info.get("entityType") != "decision":
+            continue
+        obs = info.get("observations", [])
+        outcome = "pending"
+        for o in obs:
+            if isinstance(o, str) and o.startswith("Outcome: "):
+                outcome = o[9:]
+        display = name
+        if display.startswith(_DECISION_PREFIX):
+            display = display[len(_DECISION_PREFIX):]
+        decisions.append({
+            "title": display,
+            "outcome": outcome,
+            "observations": obs[:5],
+            "updated": info.get("_updated", ""),
+        })
+    decisions.sort(key=lambda d: d["updated"], reverse=True)
+    return {"decisions": decisions, "total": len(decisions)}
+
+
+def remove_observations(entity_name, observations,
+                        memory_dir):
+    """Remove specific observations from an entity."""
+    if not isinstance(entity_name, str) \
+            or not entity_name:
+        return {"error": "entity name required"}
+    if not isinstance(observations, list):
+        return {"error": "observations must be a list"}
+
+    entities = load_graph_entities(memory_dir)
+    if entity_name not in entities:
+        return {"error": f"Entity '{entity_name}' not found"}
+
+    info = entities[entity_name]
+    cur_obs = info.get("observations", [])
+    to_remove = {o for o in observations
+                 if isinstance(o, str)}
+    kept = [o for o in cur_obs
+            if _obs_dedup_key(o) not in to_remove]
+    removed = len(cur_obs) - len(kept)
+    if removed == 0:
+        return {"removed": 0,
+                "message": "No matching observations"}
+
+    updated = dict(entities)
+    updated[entity_name] = {
+        **info,
+        "observations": kept,
+        "_updated": now_iso(),
+    }
+    rels = load_graph_relations(memory_dir)
+    try:
+        rewrite_graph(memory_dir, updated, rels)
+    except OSError:
+        return {"error": "Write failed (lock timeout)"}
+    invalidate_caches()
+    log_event("REMOVE_OBS",
+              f'entity="{entity_name}" removed={removed}')
+    return {"removed": removed}
+
+
+def rename_entity(old_name, new_name, memory_dir):
+    """Rename an entity, updating all relation references."""
+    if not old_name or not new_name:
+        return {"error": "old_name and new_name required"}
+    if old_name == new_name:
+        return {"error": "names are identical"}
+
+    entities = load_graph_entities(memory_dir)
+    if old_name not in entities:
+        return {"error": f"Entity '{old_name}' not found"}
+    if new_name in entities:
+        return {"error": f"Entity '{new_name}' already exists"}
+
+    updated = {}
+    for name, info in entities.items():
+        if name == old_name:
+            updated[new_name] = {
+                **info, "_updated": now_iso(),
+            }
+        else:
+            updated[name] = info
+
+    rels = load_graph_relations(memory_dir)
+    fixed_rels = []
+    for r in rels:
+        fr = new_name if r.get("from") == old_name \
+            else r.get("from", "")
+        to = new_name if r.get("to") == old_name \
+            else r.get("to", "")
+        fixed_rels.append({
+            "from": fr, "to": to,
+            "relationType": r.get("relationType", ""),
+        })
+
+    try:
+        rewrite_graph(memory_dir, updated, fixed_rels)
+    except OSError:
+        return {"error": "Write failed (lock timeout)"}
+    invalidate_caches()
+    log_event("RENAME",
+              f'"{old_name}" -> "{new_name}"')
+    return {"renamed": old_name, "to": new_name,
+            "relations_updated": len(
+                [r for r in rels
+                 if r.get("from") == old_name
+                 or r.get("to") == old_name])}

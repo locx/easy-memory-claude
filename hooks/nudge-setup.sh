@@ -43,7 +43,12 @@ SETUP_CMD="${HOME}/.claude/memory/.source-dir"
 if [ -f "$SETUP_CMD" ]; then
     SETUP_CMD="$(cat "$SETUP_CMD")/setup-project.sh"
 else
-    SETUP_CMD="setup-project.sh"
+    # Fallback: use known install location
+    if [ -f "${HOME}/.claude/memory/setup-project.sh" ]; then
+        SETUP_CMD="${HOME}/.claude/memory/setup-project.sh"
+    else
+        SETUP_CMD="setup-project.sh"
+    fi
 fi
 
 echo "This project does not have Claude memory set up."

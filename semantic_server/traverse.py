@@ -1,6 +1,4 @@
 """BFS relation traversal over the knowledge graph."""
-import os
-
 from .cache import (
     adjacency_cache,
     estimate_size,
@@ -12,8 +10,6 @@ from .graph import (
     load_graph_relations,
 )
 
-# Hard cap on traversal result size to prevent OOM
-# on dense graphs. 10K nodes is ~40MB worst case.
 _MAX_VISITED = 10_000
 
 
@@ -53,8 +49,6 @@ def traverse_relations(entity, memory_dir,
                        direction="both",
                        max_depth=2):
     """BFS traversal with visited-set cap."""
-    if isinstance(max_depth, bool):
-        max_depth = 2
     try:
         max_depth = min(max(int(max_depth), 1), 5)
     except (ValueError, TypeError):
@@ -64,7 +58,6 @@ def traverse_relations(entity, memory_dir,
     ):
         direction = "both"
 
-    # Quick file check before triggering a full parse
     _, mtime = get_graph_mtime(memory_dir)
     if mtime is None:
         return {

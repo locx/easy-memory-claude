@@ -34,13 +34,12 @@ from .recall import flush_recall_counts
 
 _shutdown_requested = False
 
-# Interval for merging hook sidecar buffer
 _PENDING_CHECK_INTERVAL = 5.0
 _last_pending_check = 0.0
 
 
 def _shutdown_handler(signum, frame):
-    """Signal handler — set flag for cooperative shutdown."""
+    """Set flag for cooperative shutdown."""
     global _shutdown_requested
     _shutdown_requested = True
 
@@ -48,10 +47,8 @@ def _shutdown_handler(signum, frame):
 def _merge_pending(memory_dir):
     """Merge hook sidecar buffer into graph.jsonl.
 
-    Uses rename-before-read pattern for crash safety:
-    pending → .processing → read → append → delete.
-    If .processing exists on next call, it's a leftover
-    from a prior crash and gets reprocessed.
+    Rename-before-read for crash safety: pending →
+    .processing → read → append → delete.
     """
     global _last_pending_check
     _last_pending_check = time.monotonic()
@@ -61,7 +58,6 @@ def _merge_pending(memory_dir):
     )
     processing_path = pending_path + ".processing"
 
-    # Check for leftover from prior crash first
     have_processing = os.path.exists(processing_path)
     if not have_processing:
         try:
@@ -70,7 +66,6 @@ def _merge_pending(memory_dir):
             return
         if size == 0:
             return
-        # Atomic rename — prevents duplicate processing
         try:
             os.rename(pending_path, processing_path)
         except OSError:
@@ -97,7 +92,6 @@ def _merge_pending(memory_dir):
                 memory_dir, entries,
             )
             if not ok:
-                # Lock timeout — keep .processing for retry
                 log_event(
                     "MERGE_PENDING_FAIL",
                     f"{len(entries)} entries deferred "
@@ -111,7 +105,6 @@ def _merge_pending(memory_dir):
                 "MERGE_PENDING",
                 f"{len(entries)} entries from hook sidecar",
             )
-        # Delete only after successful merge
         try:
             os.unlink(processing_path)
         except OSError:
@@ -150,12 +143,10 @@ def main():
             )
         sys.stderr.flush()
 
-    # Initialize branch detection
-    # Convention: MEMORY_DIR is <project>/.memory
+    # MEMORY_DIR convention: <project>/.memory
     project_dir = os.path.dirname(memory_dir)
     init_branch(project_dir)
 
-    # atexit for recall persistence
     atexit.register(flush_recall_counts)
 
     sys.stderr.write(
@@ -164,7 +155,6 @@ def main():
     )
     sys.stderr.flush()
 
-    # Pre-compute paths for consolidated stat checks
     idx_path = os.path.join(
         memory_dir, "tfidf_index.json"
     )
@@ -173,9 +163,9 @@ def main():
         while not _shutdown_requested:
             _now_mono = time.monotonic()
 
-            # --- Periodic tasks (run during idle) ---
+            # --- Periodic tasks ---
 
-            # Cooperative index reload — single stat()
+            # Cooperative index reload
             if (_now_mono - _cache_mod.last_index_check
                     >= INDEX_CHECK_INTERVAL):
                 _cache_mod.last_index_check = _now_mono
@@ -190,7 +180,7 @@ def main():
                 except OSError:
                     pass
 
-            # Merge hook sidecar buffer
+            # Merge hook sidecar
             if (_now_mono - _last_pending_check
                     >= _PENDING_CHECK_INTERVAL):
                 _merge_pending(memory_dir)
@@ -201,7 +191,7 @@ def main():
                         > RECALL_FLUSH_INTERVAL):
                     flush_recall_counts()
 
-            # Refresh branch detection
+            # Refresh branch
             branch, changed = refresh_branch()
             if changed:
                 log_event(
@@ -209,19 +199,16 @@ def main():
                     f"now on {branch}",
                 )
 
-            # --- Non-blocking stdin via select ---
-            # Timeout allows periodic tasks to run
-            # even when client is idle.
+            # --- Non-blocking stdin (1s timeout for tasks) ---
             try:
                 ready, _, _ = select.select(
                     [sys.stdin], [], [], 1.0
                 )
             except (ValueError, OSError):
-                # stdin closed or invalid fd
                 break
 
             if not ready:
-                continue  # timeout — loop back for tasks
+                continue
 
             try:
                 line = sys.stdin.readline()
@@ -262,11 +249,7 @@ def main():
                 sys.stderr.write(
                     f"error: handle_message: {exc}\n"
                 )
-                # Return JSON-RPC internal error
-                msg_id = (
-                    msg.get("id")
-                    if isinstance(msg, dict) else None
-                )
+                msg_id = msg.get("id")
                 if msg_id is not None:
                     response = {
                         "jsonrpc": "2.0",

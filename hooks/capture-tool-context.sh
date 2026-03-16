@@ -55,4 +55,11 @@ PY_EXIT=$?
 if [ "$PY_EXIT" -eq 0 ]; then
     touch "$MARKER"
 fi
-exit 0
+
+# Exit 2 = non-matching tool (expected), treat as success
+# Exit 0 = captured successfully
+# Other = real failure, propagate
+if [ "$PY_EXIT" -eq 0 ] || [ "$PY_EXIT" -eq 2 ]; then
+    exit 0
+fi
+exit "$PY_EXIT"

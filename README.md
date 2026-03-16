@@ -11,7 +11,7 @@ Session 1: "Use LWW for conflict resolution in SyncManager"
    └─ Claude records decision + rationale + links to SyncManager
 
 Session 2: "How does our sync work?"                         ┌─ ProviderRegistry
-   └─ Finds SyncManager (score 0.87) ─── traverses to ──────┤
+   └─ Finds SyncManager (score 0.87) ─── traverses to ───────┤
       sees the LWW decision, full context                    └─ OfflineQueue
 ```
 
@@ -21,20 +21,20 @@ Pure Python. Zero dependencies. One install, every project.
 
 ## Contents
 
-| # | Section | Covers |
-|--:|---------|--------|
-| **1** | [**What Makes This Different**](#1-what-makes-this-different) | Branch-aware · Hebbian · Self-regulating · Decisions · Incremental · Atomic |
-| **2** | [**How It Works**](#2-how-it-works) | Knowledge Graph · Tool Reference · Search · Self-Cleaning · Lifecycle Hooks |
-| **3** | [**Getting Started**](#3-getting-started) | First Run · Day-Two Operations |
-| **4** | [**Usage**](#4-usage) | Zero Effort · A Session in Action |
-| **5** | [**Decision Tracking**](#5-decision-tracking) | Record a Decision · Update the Outcome |
-| **6** | [**Configuration**](#6-configuration) | Decay · Age · Throttle · Merge |
-| **7** | [**Architecture**](#7-architecture) | Layout · Under the Hood |
-| **8** | [**Performance**](#8-performance) | Complexity · Hard Limits |
-| **9** | [**Resilience**](#9-resilience) | Branch · Crash · Lock · Power Loss |
-| **10** | [**Troubleshooting**](#10-troubleshooting) | Common Fixes |
-| **11** | [**Known Limitations**](#11-known-limitations) | TF-IDF · Locking · CJK · VSCode |
-| **12** | [**Platform & License**](#12-platform--license) | macOS · Linux · WSL · MIT |
+|  #     | Section                                                       | Covers                                                                      |
+|-------:|---------------------------------------------------------------|-----------------------------------------------------------------------------|
+| **1**  | [**What Makes This Different**](#1-what-makes-this-different) | Branch-aware · Hebbian · Self-regulating · Decisions · Incremental · Atomic |
+| **2**  | [**How It Works**](#2-how-it-works)                           | Knowledge Graph · Tool Reference · Search · Self-Cleaning · Lifecycle Hooks |
+| **3**  | [**Getting Started**](#3-getting-started)                     | First Run · Day-Two Operations                                              |
+| **4**  | [**Usage**](#4-usage)                                         | Zero Effort · A Session in Action                                           |
+| **5**  | [**Decision Tracking**](#5-decision-tracking)                 | Record · List · Update Outcome                                              |
+| **6**  | [**Configuration**](#6-configuration)                         | Decay · Age · Throttle · Merge                                              |
+| **7**  | [**Architecture**](#7-architecture)                           | Layout · Under the Hood                                                     |
+| **8**  | [**Performance**](#8-performance)                             | Complexity · Hard Limits                                                    |
+| **9**  | [**Resilience**](#9-resilience)                               | Branch · Crash · Lock · Power Loss                                          |
+| **10** | [**Troubleshooting**](#10-troubleshooting)                    | Common Fixes                                                                |
+| **11** | [**Known Limitations**](#11-known-limitations)                | TF-IDF · Locking · CJK · VSCode                                            |
+| **12** | [**Platform & License**](#12-platform--license)               | macOS · Linux · WSL · MIT                                                   |
 
 ---
 
@@ -42,14 +42,14 @@ Pure Python. Zero dependencies. One install, every project.
 
 Not another flat-file memory. Six things set this apart:
 
-| Feature | What it means |
-|---------|--------------|
-| **Branch-aware scoring** | `feature/auth` entities rank higher on that branch. Switch to `main`? Automatic rebalance. Cross-branch at 85–95%, never lost. |
-| **Hebbian recall** | Search something 10× → prune-proof. Never touch it → fades. `log(recall_count)` boost baked into every score. |
-| **Self-regulating growth** | Daily maintenance scores every entity. Below 0.1 → pruned. Above → kept. Zero intervention, zero bloat. |
-| **Structured decisions** | Not comments. Rationale, alternatives, outcomes. Auto-linked to code. Pending ones surface every session until resolved. |
-| **Incremental reads** | Byte-offset tracking. 3 new lines in a 50 MB graph? Reads only those 3 lines. |
-| **Atomic everything** | `flock` → temp → `fsync` → `os.replace`. Power loss mid-write? Old or new survives. Never corrupt. |
+| Feature                    | What it means                                                                                                                            |
+|----------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| **Branch-aware scoring**   | `feature/auth` entities rank higher on that branch. Switch to `main`? Automatic rebalance. Cross-branch at 85–95%, never lost.           |
+| **Hebbian recall**         | Search something 10× → prune-proof. Never touch it → fades. `log(recall_count)` boost baked into every score.                           |
+| **Self-regulating growth** | Daily maintenance scores every entity. Below 0.1 → pruned. Above → kept. Zero intervention, zero bloat.                                 |
+| **Structured decisions**   | Not comments. Rationale, chosen approach, alternatives, outcomes. Auto-linked to code. Pending ones surface every session until resolved. |
+| **Incremental reads**      | Byte-offset tracking. 3 new lines in a 50 MB graph? Reads only those 3 lines.                                                           |
+| **Atomic everything**      | `flock` → temp → `fsync` → `os.replace`. Power loss mid-write? Old or new survives. Never corrupt.                                      |
 
 > **CLAUDE.md** for static rules. **Knowledge graph** for everything that evolves. Use both.
 
@@ -57,7 +57,8 @@ Not another flat-file memory. Six things set this apart:
 
 ## 2. How It Works
 
-```
+<div align="center">
+<pre>
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        SESSION LIFECYCLE                            │
 │                                                                     │
@@ -65,7 +66,7 @@ Not another flat-file memory. Six things set this apart:
 │  │ Session Start│    │ During Session │    │ Session End         │  │
 │  │              │    │                │    │                     │  │
 │  │ prime-       │    │  CLI Bridge    │    │ capture-decisions   │  │
-│  │ memory.sh    │──▶ │  (10 tools)    │──▶ │ reminds Claude to   │  │
+│  │ memory.sh    │──▶ │  (14 tools)    │──▶ │ reminds Claude to   │  │
 │  │              │    │                │    │ persist decisions   │  │
 │  └──────┬───────┘    └───────┬────────┘    └─────────────────────┘  │
 │         │                    │                                      │
@@ -82,7 +83,8 @@ Not another flat-file memory. Six things set this apart:
 │  │           (append-only writes)               │                   │
 │  └──────────────────────────────────────────────┘                   │
 └─────────────────────────────────────────────────────────────────────┘
-```
+</pre>
+</div>
 
 ### a. Knowledge Graph
 
@@ -99,17 +101,18 @@ One `graph.jsonl` per project. Two object types:
 Entities carry facts, branch tags, and timestamps. Relations form directed edges. Claude traverses connections to find knowledge it wasn't told to look for.
 
 ```
-                    ┌─────────────────┐
-         uses       │ ProviderRegistry│
-    ┌──────────────▶│   (component)   │
-    │               └─────────────────┘
-┌───┴───────────┐
-│  SyncManager  │         depends-on
-│  (component)  │   ┌─────────────────┐
-│               │──▶│  OfflineQueue   │
-│ "Uses LWW     │   │  (component)    │
-│  resolution"  │   └─────────────────┘
-└───────────────┘
+                                                    ┌─────────────────┐
+                                         uses       │ ProviderRegistry│
+                    ┌──────────────────────────────▶│   (component)   │
+                    │                               └─────────────────┘
+                    │
+                ┌───┴───────────┐
+                │  SyncManager  │
+                │  (component)  │
+                │               │                   ┌─────────────────┐
+                │ "Uses LWW     │    depends-on     │  OfflineQueue   │
+                │  resolution"  │──────────────────▶│  (component)    │
+                └───────────────┘                   └─────────────────┘
 ```
 
 ### b. Tool Reference
@@ -123,18 +126,22 @@ MEMORY_DIR=$PWD/.memory PYTHONPATH=~/.claude/memory \
 
 `setup-project.sh` injects this into `CLAUDE.md`. Claude uses them autonomously.
 
-| Category | Tool | Does |
-|----------|------|------|
-| **Read** | `semantic_search_memory` | TF-IDF ranked search across names + observations |
-| | `traverse_relations` | BFS graph walk — connected subgraph |
-| | `search_memory_by_time` | Entities by time range |
-| | `graph_stats` | Counts, types, pending decisions, recall rankings |
-| **Write** | `create_entities` | Add/merge entities with observations |
-| | `create_relations` | Directed edges, auto-deduplicated |
-| | `add_observations` | Append facts to existing entities |
-| | `delete_entities` | Remove + cascade relation cleanup |
-| **Decide** | `create_decision` | Rationale, alternatives, scope, auto-linked |
-| | `update_decision_outcome` | Outcome + lesson learned |
+| Category   | Tool                       | Does                                                         |
+|------------|----------------------------|--------------------------------------------------------------|
+| **Read**   | `semantic_search_memory`   | TF-IDF ranked search across names + observations             |
+|            | `traverse_relations`       | BFS graph walk — connected subgraph                          |
+|            | `search_memory_by_time`    | Entities by time range, optional `entity_type` filter        |
+|            | `graph_stats`              | Counts, types, pending decisions, recall rankings            |
+|            | `list_decisions`           | All decisions with status, sorted by recency                 |
+| **Write**  | `create_entities`          | Add/merge entities with observations                         |
+|            | `create_relations`         | Directed edges, auto-deduplicated                            |
+|            | `add_observations`         | Append facts to existing entities                            |
+|            | `remove_observations`      | Remove specific observations (exact match)                   |
+|            | `delete_entities`          | Remove + cascade relation cleanup                            |
+|            | `rename_entity`            | Rename entity + update all relation references               |
+| **Decide** | `create_decision`          | Rationale, chosen approach, alternatives, scope, auto-linked |
+|            | `update_decision_outcome`  | Outcome + lesson learned                                     |
+| **Admin**  | `rebuild_index`            | Force TF-IDF index rebuild (normally 1x/day automatic)       |
 
 All writes: `flock` → temp → `fsync` → `os.replace`. Graph capped at 50 MB.
 
@@ -158,15 +165,15 @@ graph.jsonl ──▶ backup ──▶ stamp ──▶ score ──▶ prune ─
                 graph.jsonl ◀── index ◀── prune recall ◀── cap obs
 ```
 
-| Step | What it does |
-|------|-------------|
-| **Backup** | Hard-links `graph.jsonl` (O(1)) before mutation |
-| **Stamp** | Tags new entities with `_branch` and `_created` metadata |
-| **Score** | `obs_count × (1 / (1 + days_stale)) × (1 + log(recall_count))` |
-| **Prune** | Removes entities scoring < 0.1 with zero inbound relations |
-| **Consolidate** | Merges entities with overlapping names + same type |
-| **Cap obs** | activity-log: keep 50; others: keep 200 |
-| **Build TF-IDF** | Rebuilds search vectors, postings, magnitudes |
+| Step             | What it does                                                     |
+|------------------|------------------------------------------------------------------|
+| **Backup**       | Hard-links `graph.jsonl` (O(1)) before mutation                  |
+| **Stamp**        | Tags new entities with `_branch` and `_created` metadata         |
+| **Score**        | `obs_count × (1 / (1 + days_stale)) × (1 + log(recall_count))`  |
+| **Prune**        | Removes entities scoring < 0.1 with zero inbound relations       |
+| **Consolidate**  | Merges entities with overlapping names + same type               |
+| **Cap obs**      | activity-log: keep 50; others: keep 200                          |
+| **Build TF-IDF** | Rebuilds search vectors, postings, magnitudes                    |
 
 > **Scoring in practice:**
 > - 5 obs, today, searched 10× → **16.5** — kept
@@ -177,12 +184,12 @@ graph.jsonl ──▶ backup ──▶ stamp ──▶ score ──▶ prune ─
 
 Four hooks, CLI only. VSCode detected and skipped in <1ms — `CLAUDE.md` handles it.
 
-| Hook | Event | Action |
-|------|-------|--------|
-| `prime-memory.sh` | SessionStart | Maintenance + scored recall with 1-hop relations + pending decisions |
-| `capture-tool-context.sh` | PostToolUse | File edits → graph observations (throttled 1x/30s) |
-| `capture-decisions.sh` | Stop | Persist-decisions reminder |
-| `nudge-setup.sh` | SessionStart | One-time setup notice (no `.memory/`) |
+| Hook                       | Event        | Action                                                               |
+|----------------------------|--------------|----------------------------------------------------------------------|
+| `prime-memory.sh`          | SessionStart | Maintenance + scored recall with 1-hop relations + pending decisions |
+| `capture-tool-context.sh`  | PostToolUse  | File edits → graph observations (throttled 1x/30s)                   |
+| `capture-decisions.sh`     | Stop         | Persist-decisions reminder                                           |
+| `nudge-setup.sh`           | SessionStart | One-time setup notice (no `.memory/`)                                |
 
 ---
 
@@ -203,10 +210,10 @@ MEMORY_DIR=/path/to/project/.memory PYTHONPATH=~/.claude/memory \
   python3 ~/.claude/memory/memory-cli.py graph_stats
 ```
 
-> | Script | What it does |
-> |--------|-------------|
-> | **`install.sh`** | Deploys runtime, CLI bridge, hooks, wires `settings.json` |
-> | **`setup-project.sh`** | Creates `.memory/`, injects bridge into `CLAUDE.md`, bootstraps graph (up to 200 files), removes legacy MCP configs |
+> | Script                 | What it does                                                                                                |
+> |------------------------|-------------------------------------------------------------------------------------------------------------|
+> | **`install.sh`**       | Deploys runtime, CLI bridge, hooks, wires `settings.json`                                                   |
+> | **`setup-project.sh`** | Creates `.memory/`, injects bridge into `CLAUDE.md`, bootstraps graph (up to 200 files), removes legacy MCP |
 >
 > Both are safe to re-run. `setup-project.sh` upgrades the `CLAUDE.md` section in place.
 
@@ -250,7 +257,7 @@ Memory: 42e 28r 3d 0w branch:main
 
 **VSCode** — same tools, same behavior. `CLAUDE.md` bridge drives it. No hooks needed.
 
-> New entities are immediately traversable. TF-IDF search updates at next maintenance.
+> New entities are immediately traversable. TF-IDF search updates at next maintenance (or force via `rebuild_index`).
 
 ### b. A Session in Action
 
@@ -263,9 +270,13 @@ Memory: 42e 28r 3d 0w branch:main
    Claude edits code → hooks capture observations
    Claude silently: create_decision({
      title: "Switch from LWW to CRDT",
+     chosen: "CRDT merge",
      rationale: "Preserve concurrent edits",
      alternatives: ["LWW — simpler but loses writes"]
    })
+
+3. USER: "What decisions have we made?"
+   Claude → list_decisions() → all decisions with status
 ```
 
 ---
@@ -280,15 +291,28 @@ Decisions are **structured graph entities** — not notes, not comments.
 create_decision({
   title: "Use PostgreSQL over MongoDB for user data",
   rationale: "ACID for billing. Relational model fits user/org hierarchy.",
+  chosen: "PostgreSQL",
   alternatives: ["MongoDB — no multi-doc txns", "CockroachDB — too much ops"],
   scope: "UserService, BillingModule",
   related_entities: ["UserService", "BillingModule"]
 })
 ```
 
-Creates a `decision` entity with observations + `decided-for` edges to related entities.
+Creates a `decision` entity with observations (rationale, chosen approach, alternatives) + `decided-for` edges to related entities.
 
-### b. Update the Outcome
+### b. List Decisions
+
+```
+list_decisions()
+→ { decisions: [
+    { title: "Use PostgreSQL", outcome: "successful", updated: "2026-03-15" },
+    { title: "Migration strategy v2", outcome: "pending", updated: "2026-03-10" }
+  ], total: 2 }
+```
+
+Returns all decisions sorted by recency with their current outcome status.
+
+### c. Update the Outcome
 
 ```
 update_decision_outcome({
@@ -308,12 +332,12 @@ Pending decisions surface **every session start** until resolved. Stale unresolv
 
 `.memory/config.json` — delete any key for default:
 
-| Key | Default | Effect |
-|-----|---------|--------|
-| `decay_threshold` | 0.1 | Score floor for pruning |
-| `max_age_days` | 90 | Age penalty ceiling |
-| `throttle_hours` | 24 | Maintenance frequency |
-| `min_merge_name_len` | 4 | Exact-match threshold for short names |
+| Key                  | Default | Effect                                |
+|----------------------|---------|---------------------------------------|
+| `decay_threshold`    | 0.1     | Score floor for pruning               |
+| `max_age_days`       | 90      | Age penalty ceiling                   |
+| `throttle_hours`     | 24      | Maintenance frequency                 |
+| `min_merge_name_len` | 4       | Exact-match threshold for short names |
 
 Long-lived projects → `max_age_days: 365`. Fast prototypes → `throttle_hours: 12`.
 
@@ -348,11 +372,11 @@ Long-lived projects → `max_age_days: 365`. Fast prototypes → `throttle_hours
 
 `semantic_server/` — 12 modules in 3 layers:
 
-| Layer | Modules | Role |
-|-------|---------|------|
-| **Storage** | `graph.py`, `_json.py` | Incremental byte-offset reads, flock + atomic writes, orjson fallback |
-| **Intelligence** | `search.py`, `traverse.py`, `recall.py` | TF-IDF + postings, BFS + cached adjacency, Hebbian LRU |
-| **Operations** | `tools.py`, `cache.py` | Write ops + decisions, mtime caches + tiered eviction |
+| Layer            | Modules                                  | Role                                                                  |
+|------------------|------------------------------------------|-----------------------------------------------------------------------|
+| **Storage**      | `graph.py`, `_json.py`                   | Incremental byte-offset reads, flock + atomic writes, orjson fallback |
+| **Intelligence** | `search.py`, `traverse.py`, `recall.py`  | TF-IDF + postings, BFS + cached adjacency, Hebbian LRU               |
+| **Operations**   | `tools.py`, `cache.py`                   | Write ops + decisions, mtime caches + tiered eviction                 |
 
 Eviction order: index (largest, cheapest) → adjacency → entities → relations.
 
@@ -362,52 +386,57 @@ Eviction order: index (largest, cheapest) → adjacency → entities → relatio
 
 Sub-second up to 100K entities. Writes are O(1) appends.
 
-| Operation | Complexity | Notes |
-|-----------|-----------|-------|
-| `semantic_search_memory` | O(k) | Postings index; heap-based top-k |
-| `traverse_relations` | O(V+E) | Cached adjacency lists |
-| `create_entities` | O(1) | Append-only JSONL with flock |
-| `delete_entities` | O(n) | Must rewrite graph; locked + atomic |
-| `maintenance` | O(n log n) | Sorted-merge consolidation |
+| Operation                  | Complexity | Notes                                         |
+|----------------------------|------------|-----------------------------------------------|
+| `semantic_search_memory`   | O(k)       | Postings index; heap-based top-k              |
+| `traverse_relations`       | O(V+E)     | Cached adjacency lists                        |
+| `search_memory_by_time`    | O(n)       | Linear scan with optional type filter         |
+| `create_entities`          | O(1)       | Append-only JSONL with flock                  |
+| `delete_entities`          | O(n)       | Must rewrite graph; locked + atomic           |
+| `remove_observations`      | O(n)       | Graph rewrite for target entity               |
+| `rename_entity`            | O(n)       | Graph rewrite — entity + relation refs        |
+| `list_decisions`           | O(n)       | Scans entities for decision type              |
+| `rebuild_index`            | O(n log n) | Full maintenance cycle                        |
+| `maintenance`              | O(n log n) | Sorted-merge consolidation                    |
 
 ### a. Hard Limits
 
-| Resource | Cap |
-|----------|-----|
-| Graph file | 50 MB |
-| Entities | 100K |
-| Combined cache | 50 MB |
-| Recall entries | 10K LRU |
-| Obs/entity | 50 activity-log / 200 others |
-| BFS depth | 10K nodes |
-| Parse budget | 10s |
+| Resource       | Cap                          |
+|----------------|------------------------------|
+| Graph file     | 50 MB                        |
+| Entities       | 100K                         |
+| Combined cache | 50 MB                        |
+| Recall entries | 10K LRU                      |
+| Obs/entity     | 50 activity-log / 200 others |
+| BFS depth      | 10K nodes                    |
+| Parse budget   | 10s                          |
 
 ---
 
 ## 9. Resilience
 
-| Scenario | Behavior |
-|----------|----------|
-| Branch switch | `_branch` tags rebalance scores — cross-branch at 85-95%, never lost |
-| graph.jsonl corrupt | Backup before maintenance; atomic writes prevent partial corruption |
-| graph.jsonl missing | Auto-creates on first write |
-| Concurrent writes | `flock` mutual exclusion |
-| Power loss mid-write | `fsync` + `os.replace` — old or new survives, never partial |
-| Duplicate entities | Deduplicated on parse, merged by maintenance |
-| Graph edited during maintenance | mtime guard → skip, retry next run |
+| Scenario                        | Behavior                                                                     |
+|---------------------------------|------------------------------------------------------------------------------|
+| Branch switch                   | `_branch` tags rebalance scores — cross-branch at 85-95%, never lost         |
+| graph.jsonl corrupt             | Backup before maintenance; atomic writes prevent partial corruption          |
+| graph.jsonl missing             | Auto-creates on first write                                                  |
+| Concurrent writes               | `flock` mutual exclusion                                                     |
+| Power loss mid-write            | `fsync` + `os.replace` — old or new survives, never partial                  |
+| Duplicate entities              | Deduplicated on parse, merged by maintenance                                 |
+| Graph edited during maintenance | mtime guard → skip, retry next run                                           |
 
 ---
 
 ## 10. Troubleshooting
 
-| Symptom | Fix |
-|---------|-----|
-| Tools missing | Re-run `install.sh` |
-| Search empty | Rebuild index: `python3 ~/.claude/memory/maintenance.py /path` |
-| Graph too large | Raise `decay_threshold` or run maintenance |
+| Symptom                | Fix                                                                                                       |
+|------------------------|-----------------------------------------------------------------------------------------------------------|
+| Tools missing          | Re-run `install.sh`                                                                                       |
+| Search empty           | Rebuild index: `memory-cli.py rebuild_index` or `python3 ~/.claude/memory/maintenance.py /path`           |
+| Graph too large        | Raise `decay_threshold` or run maintenance                                                                |
 | Hooks silent in VSCode | [Expected](https://github.com/anthropics/claude-code/issues/21736) — CLI bridge in `CLAUDE.md` handles it |
-| Agent asks permission | Re-run `setup-project.sh` — needs "Mandatory behavior" in `CLAUDE.md` |
-| Maintenance stuck | Delete `.memory/.last-maintenance` |
+| Agent asks permission  | Re-run `setup-project.sh` — needs "Mandatory behavior" in `CLAUDE.md`                                    |
+| Maintenance stuck      | Delete `.memory/.last-maintenance`                                                                        |
 
 ---
 

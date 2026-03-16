@@ -1,11 +1,4 @@
-"""Graph I/O: JSONL parsing, loading, locking, appending, rewriting.
-
-Handles all disk interaction with graph.jsonl including:
-- Mtime-based cache loading for entities and relations
-- Incremental reads via byte-offset tracking
-- Exclusive file locking for write safety
-- Atomic writes (temp file + fsync + os.replace)
-"""
+"""Graph I/O: JSONL parsing, loading, locking, appending, rewriting."""
 import json
 import os
 import sys
@@ -89,11 +82,8 @@ def get_graph_mtime(memory_dir):
 def _parse_graph_file(graph_path, start_offset=0):
     """Parse graph.jsonl into (entities_dict, relations_list).
 
-    Merges duplicate entity names, deduplicates observations,
-    keeps earliest _created and latest _updated.
-    Supports start_offset for incremental reads.
-
-    Returns (entities, relations, end_offset).
+    Merges duplicate entity names. Supports start_offset
+    for incremental reads. Returns (entities, relations, end_offset).
     """
     entities = {}
     relations = []
@@ -167,8 +157,7 @@ def _parse_graph_file(graph_path, start_offset=0):
                                     obj.get("_updated", "")
                                 ),
                             )
-                            # First-writer-wins: keep
-                            # creation branch, not last
+                            # First-writer-wins for branch
                             branch = obj.get("_branch")
                             if branch \
                                     and not prev.get(
@@ -315,7 +304,6 @@ def load_graph_entities(memory_dir):
                     )
                 else:
                     existing[name] = info
-            # Merge new relations (deduplicated)
             if relation_cache["data"] is not None \
                     and new_rels:
                 existing_keys = {

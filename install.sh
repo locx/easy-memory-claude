@@ -1,43 +1,8 @@
 #!/bin/bash
-# ============================================================
-# Claude Memory Infrastructure — Single-File Installer
-# ============================================================
-# Deploys runtime memory tools to ~/.claude/ for all projects.
+# Claude Memory Infrastructure — Installer
+# Deploys runtime tools to ~/.claude/memory/ and hooks to ~/.claude/hooks/.
 # Run from the easy-memory-claude project directory.
-#
-# Layout after install:
-#   ~/.claude/memory/              Runtime scripts only
-#     maintenance.py               Decay/prune/consolidate/TF-IDF
-#     semantic_server/             Package (used by CLI bridge)
-#     semantic_server.py           Compat shim for legacy configs
-#     memory-cli.py               CLI bridge for memory tools
-#   ~/.claude/hooks/               Global lifecycle hooks
-#     prime-memory.sh              SessionStart — maintenance + context
-#     capture-decisions.sh         Stop — persist decision reminder
-#     nudge-setup.sh               SessionStart — setup nudge
-#     capture-tool-context.sh      PostToolUse — observation capture
-#     capture_tool_context.py      PostToolUse — Python handler
-#     smart_recall.py              SessionStart — scored recall
-#   ~/.claude/settings.json        Updated with hook wiring
-#
-# Dev/install files stay in easy-memory-claude project:
-#   ~/projects/easy-memory-claude/
-#     install.sh                   This installer
-#     hooks/                       Hook source files (copied on install)
-#       prime-memory.sh            SessionStart — maintenance + context
-#       capture-decisions.sh       Stop — persist decision reminder
-#       nudge-setup.sh             SessionStart — setup nudge
-#       capture-tool-context.sh    PostToolUse — observation capture
-#     setup-project.sh             Initialize any project for memory
-#     requirements.txt             Optional deps for neural upgrade
-#     .venv/                       Dedicated Python venv
-#
-# Per-project setup (run after install):
-#   ~/projects/easy-memory-claude/setup-project.sh /path/to/project
-#
-# Requirements: python3 3.10+, git
-# Platform: macOS / Linux
-# ============================================================
+# Requirements: python3 3.10+, git | Platform: macOS / Linux
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -50,7 +15,7 @@ echo "=== Claude Memory Infrastructure Installer ==="
 echo "  Source: ${SCRIPT_DIR}"
 echo ""
 
-# --- Preflight checks ---
+# --- Step 1: Preflight checks (python3, git, version) ---
 echo "[1/5] Preflight checks..."
 
 check_cmd() {
@@ -74,17 +39,17 @@ fi
 echo "  [ok] Python $PY_VER"
 echo ""
 
-# --- Create directories ---
+# --- Step 2: Create ~/.claude/memory/ and ~/.claude/hooks/ ---
 echo "[2/5] Creating directories..."
 mkdir -p "${MEMORY_DIR}" "${HOOKS_DIR}"
 echo "  [ok] ${MEMORY_DIR}/"
 echo "  [ok] ${HOOKS_DIR}/"
 echo ""
 
-# --- Deploy runtime scripts ---
+# --- Step 3: Deploy runtime scripts to ~/.claude/memory/ ---
 echo "[3/5] Deploying runtime scripts..."
 
-# Source files must exist from git checkout
+# Verify source files exist
 for src in maintenance.py semantic_server/__init__.py; do
     if [ ! -f "${SCRIPT_DIR}/${src}" ]; then
         echo "  ERROR: ${SCRIPT_DIR}/${src} not found."
@@ -93,30 +58,30 @@ for src in maintenance.py semantic_server/__init__.py; do
     fi
 done
 
+# Deploy maintenance.py
 cp "${SCRIPT_DIR}/maintenance.py" "${MEMORY_DIR}/maintenance.py"
 chmod +x "${MEMORY_DIR}/maintenance.py"
 echo "  [ok] maintenance.py → ${MEMORY_DIR}/"
 
-# Deploy semantic_server package (directory)
+# Deploy semantic_server package (clean copy)
 rm -rf "${MEMORY_DIR}/semantic_server"
 cp -r "${SCRIPT_DIR}/semantic_server" "${MEMORY_DIR}/semantic_server"
-# Remove __pycache__ from copied package
 find "${MEMORY_DIR}/semantic_server" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 echo "  [ok] semantic_server/ → ${MEMORY_DIR}/"
 
-# Deploy backwards-compatible shim for legacy .mcp.json configs
+# Deploy backwards-compatible entry point shim
 cp "${SCRIPT_DIR}/semantic_server.py" "${MEMORY_DIR}/semantic_server.py"
 chmod +x "${MEMORY_DIR}/semantic_server.py"
 echo "  [ok] semantic_server.py (compat shim) → ${MEMORY_DIR}/"
 printf '%s' "${SCRIPT_DIR}" > "${MEMORY_DIR}/.source-dir"
 echo "  [ok] .source-dir → ${MEMORY_DIR}/"
 
-# Deploy CLI bridge (primary tool access for both CLI and VSCode)
+# Deploy CLI bridge for VSCode fallback
 cp "${SCRIPT_DIR}/memory-cli.py" "${MEMORY_DIR}/memory-cli.py"
 chmod +x "${MEMORY_DIR}/memory-cli.py"
 echo "  [ok] memory-cli.py (CLI bridge) → ${MEMORY_DIR}/"
 
-# Optional: orjson for 3-10x faster graph I/O
+# Optional: orjson for faster graph I/O
 if python3 -c "import orjson" 2>/dev/null; then
     echo "  [ok] orjson already installed"
 else
@@ -140,7 +105,7 @@ else
 fi
 echo ""
 
-# --- Deploy hooks ---
+# --- Step 4: Deploy hook scripts to ~/.claude/hooks/ ---
 echo "[4/5] Deploying global hooks..."
 
 HOOK_SRC="${SCRIPT_DIR}/hooks"
@@ -156,10 +121,11 @@ for hook in prime-memory.sh capture-decisions.sh nudge-setup.sh capture-tool-con
 done
 echo ""
 
-# --- Update settings.json ---
+# --- Step 5: Wire hooks into settings.json ---
 echo "[5/5] Configuring hooks in settings.json..."
 
 if [ ! -f "${SETTINGS}" ]; then
+    # Create fresh settings with all memory hooks
     cat > "${SETTINGS}" << 'SETEOF'
 {
   "hooks": {
@@ -209,6 +175,7 @@ if [ ! -f "${SETTINGS}" ]; then
 SETEOF
     echo "  [ok] Created ${SETTINGS} with hooks"
 else
+    # Merge memory hooks into existing settings (idempotent)
     python3 - "${SETTINGS}" << 'PYEOF'
 import json, os, sys, shutil
 
@@ -224,7 +191,6 @@ except (json.JSONDecodeError, ValueError):
 
 hooks = cfg.setdefault('hooks', {})
 
-# Memory hook entries to ensure exist
 memory_hooks = {
     'SessionStart': [
         {'type': 'command', 'command': '$HOME/.claude/hooks/prime-memory.sh', 'timeout': 10},
@@ -241,7 +207,7 @@ memory_hooks = {
 changed = False
 for event, new_entries in memory_hooks.items():
     groups = hooks.setdefault(event, [])
-    # Find or create the catch-all group (matcher='')
+    # Find or create catch-all matcher group
     catch_all = None
     for g in groups:
         if g.get('matcher', '') == '':

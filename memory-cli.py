@@ -1,28 +1,16 @@
 #!/usr/bin/env python3
 """CLI bridge for memory tools — VSCode fallback.
 
-When the MCP server can't be connected (e.g., VSCode extension),
-this script lets Claude call memory tools directly via Bash:
-
-    python3 ~/.claude/memory/memory-cli.py <tool> [json_args]
-
-Examples:
-    python3 ~/.claude/memory/memory-cli.py graph_stats
-    python3 ~/.claude/memory/memory-cli.py semantic_search_memory '{"query":"auth"}'
-    python3 ~/.claude/memory/memory-cli.py create_decision '{"title":"Use JWT","rationale":"Stateless"}'
-
-Requires MEMORY_DIR env var or --memory-dir flag.
+Usage: python3 memory-cli.py [--memory-dir DIR] <tool> [json_args]
 """
 import json
 import os
 import sys
 
-# Add semantic_server to path
-_claude_memory = os.path.join(
-    os.path.expanduser("~"), ".claude", "memory"
-)
-if _claude_memory not in sys.path:
-    sys.path.insert(0, _claude_memory)
+# Add script's own directory to path
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
 
 def _resolve_memory_dir(argv):
@@ -57,20 +45,26 @@ def _usage():
         "  traverse_relations      "
         '{"entity":"...","direction":"both"}\n'
         "  search_memory_by_time   "
-        '{"since":"2026-03-01T00:00:00Z"}\n'
+        '{"since":"...","entity_type":"decision"}\n'
         "  create_entities         "
         '{"entities":[...]}\n'
         "  create_relations        "
         '{"relations":[...]}\n'
         "  add_observations        "
         '{"entity":"...","observations":[...]}\n'
+        "  remove_observations     "
+        '{"entity":"...","observations":[...]}\n'
         "  delete_entities         "
         '{"entity_names":[...]}\n'
+        "  rename_entity           "
+        '{"old_name":"...","new_name":"..."}\n'
         "  create_decision         "
         '{"title":"...","rationale":"..."}\n'
         "  update_decision_outcome "
         '{"title":"...","outcome":"successful"}\n'
-        "  graph_stats             (no args needed)",
+        "  list_decisions          (no args needed)\n"
+        "  graph_stats             (no args needed)\n"
+        "  rebuild_index           (no args needed)",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -107,7 +101,15 @@ def main():
         )
         sys.exit(1)
 
-    # Import handlers directly — no MCP protocol overhead
+    if tool_name == "rebuild_index":
+        import maintenance
+        indexed = maintenance.rebuild_index(memory_dir)
+        print(json.dumps({
+            "rebuilt": indexed > 0,
+            "indexed": indexed,
+        }))
+        return
+
     from semantic_server.search import search, search_by_time
     from semantic_server.tools import (
         add_observations,
@@ -116,15 +118,24 @@ def main():
         create_relations,
         delete_entities,
         graph_stats,
+        list_decisions,
+        remove_observations,
+        rename_entity,
         update_decision_outcome,
     )
     from semantic_server.traverse import traverse_relations
     from semantic_server.graph import load_index
-    from semantic_server.recall import load_recall_counts
+    from semantic_server.recall import init_recall_state
 
-    # Initialize index + recall (normally done by MCP init)
-    load_index(memory_dir)
-    load_recall_counts(memory_dir)
+    try:
+        load_index(memory_dir)
+        init_recall_state(memory_dir)
+    except Exception as exc:
+        print(
+            f"Warning: index init failed ({exc}), "
+            f"search may be degraded",
+            file=sys.stderr,
+        )
 
     dispatch = {
         "semantic_search_memory": lambda a: search(
@@ -145,6 +156,7 @@ def main():
             a.get("until"),
             a.get("limit", 20),
             branch_filter=a.get("branch_filter"),
+            entity_type=a.get("entity_type"),
         ),
         "create_entities": lambda a: create_entities(
             a.get("entities", []),
@@ -159,8 +171,18 @@ def main():
             a.get("observations", []),
             memory_dir,
         ),
+        "remove_observations": lambda a: remove_observations(
+            a.get("entity", ""),
+            a.get("observations", []),
+            memory_dir,
+        ),
         "delete_entities": lambda a: delete_entities(
             a.get("entity_names", []),
+            memory_dir,
+        ),
+        "rename_entity": lambda a: rename_entity(
+            a.get("old_name", ""),
+            a.get("new_name", ""),
             memory_dir,
         ),
         "create_decision": lambda a: create_decision(
@@ -168,6 +190,9 @@ def main():
         ),
         "update_decision_outcome": lambda a: (
             update_decision_outcome(a, memory_dir)
+        ),
+        "list_decisions": lambda a: list_decisions(
+            memory_dir
         ),
         "graph_stats": lambda a: graph_stats(memory_dir),
     }

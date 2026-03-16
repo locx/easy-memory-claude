@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """Memory graph maintenance: decay, prune, consolidate, TF-IDF index.
 
-Pure Python — zero external dependencies. Works without any venv.
-Designed to run from SessionStart hook, throttled to 1x/day.
-Platform: Unix/macOS (uses fcntl for file locking).
-
-Usage:
-    python3 maintenance.py [project_dir]
-    # or via env: CLAUDE_PROJECT_DIR=/path/to/project python3 maintenance.py
+Pure Python — zero external dependencies. Throttled to 1x/day.
+Usage: python3 maintenance.py [project_dir]
 """
 try:
     import fcntl
@@ -26,8 +21,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import chain
 from pathlib import Path
 
-# Fast JSON backend — same pattern as semantic_server/_json.py
-# Falls back gracefully to stdlib json.
+# Fast JSON backend — falls back to stdlib json
 try:
     from semantic_server._json import (
         loads as _loads, dumps as _dumps, dump as _dump,
@@ -49,7 +43,7 @@ except ImportError:
             sep = kw.get("separators", (",", ":"))
             json.dump(obj, f, separators=sep)
 
-# --- Configuration (defaults, overridable via .memory/config.json) ---
+# Configuration defaults (overridable via .memory/config.json)
 _DEFAULTS = {
     "DECAY_THRESHOLD": 0.1,
     "MAX_AGE_DAYS": 90,
@@ -58,7 +52,6 @@ _DEFAULTS = {
     "MAX_LOG_BYTES": 100_000,
 }
 
-# Mutable config — populated by _load_config()
 _cfg = dict(_DEFAULTS)
 
 
@@ -101,8 +94,7 @@ def _load_config(memory_dir):
     _cfg.update(overrides)
 
 
-# Pre-compiled regexes (avoid per-call re.compile overhead)
-# Unicode-aware camelCase splitting
+# Pre-compiled regexes (Unicode-aware)
 _RE_CAMEL = re.compile(
     r'([a-z\u00e0-\u00ff])([A-Z\u00c0-\u00df])'
 )
@@ -111,11 +103,7 @@ _RE_WORDS = re.compile(r'\w+', re.UNICODE)
 
 
 def iter_jsonl(path):
-    """Yield dicts from JSONL file, skip malformed/non-dict lines.
-
-    Generator — avoids building full list in memory.
-    Consumers that need a list can call list(iter_jsonl(path)).
-    """
+    """Yield dicts from JSONL file, skip malformed lines."""
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -130,11 +118,7 @@ def iter_jsonl(path):
 
 
 def partition_graph(path):
-    """Load and partition JSONL graph in a single pass.
-
-    Returns (entities, relations, others) lists.
-    Streams from disk — never holds the full unparsed list.
-    """
+    """Single-pass JSONL partition into (entities, relations, others)."""
     entities, relations, others = [], [], []
     for e in iter_jsonl(path):
         t = e.get("type")
@@ -157,12 +141,7 @@ def _safe_jsonl_lines(entries):
 
 
 def write_jsonl(path, entries):
-    """Atomic write: write to .new, then os.replace.
-
-    Uses .new suffix so interrupted writes leave original
-    intact. Cleans up on failure. Skips unserializable
-    entries instead of aborting.
-    """
+    """Atomic write via .new + os.replace. Skips unserializable."""
     tmp = path + ".new"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -179,13 +158,7 @@ def write_jsonl(path, entries):
 
 
 def get_branch(cwd=None):
-    """Get current git branch, or 'unknown'.
-
-    Args:
-        cwd: directory to run git in (defaults to process cwd).
-             Prevents stamping wrong branch when hook cwd
-             differs from project dir.
-    """
+    """Get current git branch, or 'unknown'."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -200,12 +173,7 @@ def get_branch(cwd=None):
 
 
 def parse_iso_date(s):
-    """Parse ISO 8601 date string to tz-aware datetime.
-
-    Always returns UTC-aware datetime or None. Bare ISO
-    strings (no tz) are assumed UTC to avoid TypeError when
-    subtracting from datetime.now(timezone.utc).
-    """
+    """Parse ISO 8601 to tz-aware datetime (assumes UTC if bare)."""
     try:
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
@@ -217,7 +185,7 @@ def parse_iso_date(s):
         return None
 
 
-def load_recall_counts(memory_dir):
+def read_recall_counts(memory_dir):
     """Load recall frequency counts from sidecar file."""
     rc_path = os.path.join(memory_dir, "recall_counts.json")
     try:
@@ -230,17 +198,12 @@ def load_recall_counts(memory_dir):
     return {}
 
 
-def score_entity(entity, now, recall_counts=None,
-                 now_ts=None, cutoff_str=None):
-    """Score entity: obs_count * recency * recall_boost.
+def score_entity(entity, now_ts, recall_counts=None,
+                 cutoff_str=None):
+    """Score: obs_count * recency * recall_boost.
 
-    Uses string comparison for fast age check. Only falls
-    back to datetime parsing for entities near the decay
-    threshold. now_ts/cutoff_str are pre-computed by caller
-    for batch efficiency.
-
-    recall_boost = 1 + log(recall_count) when recall data
-    is available (Hebbian reinforcement).
+    Uses string comparison for fast age check; falls back
+    to datetime parsing near the decay threshold.
     """
     obs_count = len(entity.get("observations", []))
     if obs_count == 0:
@@ -254,12 +217,10 @@ def score_entity(entity, now, recall_counts=None,
         dt = parse_iso_date(updated)
         if not dt:
             days = _cfg["MAX_AGE_DAYS"]
-        elif now_ts:
+        else:
             days = max(
                 int((now_ts - dt.timestamp()) / 86400), 0
             )
-        else:
-            days = max((now - dt).days, 0)
 
     recency = 1.0 / (1.0 + days)
     score = obs_count * recency
@@ -273,16 +234,11 @@ def score_entity(entity, now, recall_counts=None,
 
 
 def prune_entities(entities, relations, recall_counts=None):
-    """Remove low-score entities with zero inbound relations.
-
-    Pre-computes cutoff_str for fast string-based age
-    comparison in score_entity().
-    """
+    """Remove low-score entities with zero inbound relations."""
     has_inbound = {r.get("to", "") for r in relations}
-    now = datetime.now(timezone.utc)
     now_ts = time.time()
-    # Pre-compute cutoff date string for fast path
-    cutoff_dt = now - timedelta(days=_cfg["MAX_AGE_DAYS"])
+    cutoff_dt = (datetime.now(timezone.utc)
+                 - timedelta(days=_cfg["MAX_AGE_DAYS"]))
     cutoff_str = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     pruned_names = set()
@@ -293,8 +249,8 @@ def prune_entities(entities, relations, recall_counts=None):
             pruned_names.add(name)
             continue
         score = score_entity(
-            e, now, recall_counts,
-            now_ts=now_ts, cutoff_str=cutoff_str,
+            e, now_ts, recall_counts,
+            cutoff_str=cutoff_str,
         )
         if (score < _cfg["DECAY_THRESHOLD"]
                 and name not in has_inbound):
@@ -302,7 +258,6 @@ def prune_entities(entities, relations, recall_counts=None):
             continue
         kept.append(e)
 
-    # Drop orphaned relations
     kept_rels = [
         r for r in relations
         if r.get("from") not in pruned_names
@@ -312,11 +267,7 @@ def prune_entities(entities, relations, recall_counts=None):
 
 
 def normalize_name(name):
-    """Normalize entity name for fuzzy matching.
-
-    Handles camelCase, snake_case, kebab-case.
-    Unicode-aware via re.UNICODE flag.
-    """
+    """Normalize entity name for fuzzy matching."""
     name = _RE_CAMEL.sub(r'\1 \2', name)
     return _RE_SEPS.sub(' ', name.lower().strip())
 
@@ -336,9 +287,14 @@ def _safe_obs_dedup(observations):
     return result
 
 
-_MAIN_BRANCHES = frozenset({
-    "main", "master", "trunk", "develop",
-})
+try:
+    from semantic_server.config import (
+        MAIN_BRANCHES as _MAIN_BRANCHES,
+    )
+except ImportError:
+    _MAIN_BRANCHES = frozenset({
+        "main", "master", "trunk", "develop",
+    })
 _GUARD_AGE_DAYS = 7
 _MAX_CONSOLIDATE_ENTITIES = 50_000
 
@@ -346,18 +302,10 @@ _MAX_CONSOLIDATE_ENTITIES = 50_000
 def consolidate(entities, relations):
     """Merge entities with same type + overlapping names.
 
-    O(n log n) sorted-merge: sorts by (entityType,
-    normalized_name), then scans linearly with a small
-    lookahead window to find substring matches among
-    adjacent entries.
-
-    Short names (< MIN_MERGE_NAME_LEN) merge only on
-    exact normalized match.
-
-    Skips consolidation if entity count exceeds
-    _MAX_CONSOLIDATE_ENTITIES to prevent OOM.
+    O(n log n) sorted-merge with lookahead window. Short
+    names (< MIN_MERGE_NAME_LEN) merge only on exact match.
+    Skips if entity count exceeds safety cap.
     """
-    # Memory guard
     if len(entities) > _MAX_CONSOLIDATE_ENTITIES:
         import sys as _sys
         print(
@@ -370,13 +318,11 @@ def consolidate(entities, relations):
 
     min_merge = _cfg["MIN_MERGE_NAME_LEN"]
 
-    # Age-gated cross-branch consolidation guard
     guard_cutoff = (
         datetime.now(timezone.utc)
         - timedelta(days=_GUARD_AGE_DAYS)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Build sort keys: (entityType, normalized_name, idx)
     n = len(entities)
     keyed = []
     for i, e in enumerate(entities):
@@ -384,16 +330,11 @@ def consolidate(entities, relations):
         etype = e.get("entityType", "")
         keyed.append((etype, norm, i))
 
-    # O(n log n) sort — puts merge candidates adjacent
     keyed.sort()
 
     merged_count = 0
-    absorbed = set()  # indices absorbed into another
+    absorbed = set()
     renames = {}
-
-    # Lookahead window — check next entries with same
-    # entityType for substring match. Window size is
-    # small (20) so inner loop is effectively O(1).
     WINDOW = 20
 
     for pos in range(n):
@@ -407,13 +348,11 @@ def consolidate(entities, relations):
         obs_dict_i = None
         len_i = len(norm_i)
 
-        # Scan forward within same entityType
         for ahead in range(1, WINDOW + 1):
             j = pos + ahead
             if j >= n:
                 break
             etype_j, norm_j, idx_j = keyed[j]
-            # Stop at type boundary
             if etype_j != etype_i:
                 break
             if idx_j in absorbed:
@@ -422,21 +361,16 @@ def consolidate(entities, relations):
                 continue
 
             len_j = len(norm_j)
-            # Length ratio check — tightened to 2x
-            # to prevent false merges on common names
+            # Tightened to 2x to prevent false merges
             if len_i > 2 * len_j or len_j > 2 * len_i:
                 continue
 
-            # Short names merge only on exact match
             shorter = min(len_i, len_j)
             if shorter < min_merge:
                 if norm_i != norm_j:
                     continue
 
-            # Word-boundary containment — prevents
-            # "config" merging with "project config"
-            # unless one is a proper word-boundary
-            # substring of the other.
+            # Word-boundary containment check
             padded_i = f" {norm_i} "
             padded_j = f" {norm_j} "
             if (norm_i == norm_j
@@ -474,7 +408,6 @@ def consolidate(entities, relations):
                     if key not in _seen_i:
                         _seen_i.add(key)
                         obs_dict_i.append(o)
-                # Keep newer _updated
                 upd_j = ent_j.get("_updated", "")
                 upd_i = ent_i.get("_updated", "")
                 if upd_j and (not upd_i
@@ -490,7 +423,6 @@ def consolidate(entities, relations):
         if obs_dict_i is not None:
             ent_i["observations"] = list(obs_dict_i)
 
-    # Free sort key list
     del keyed
 
     kept = [
@@ -498,8 +430,7 @@ def consolidate(entities, relations):
         if i not in absorbed
     ]
 
-    # Cap observations to prevent unbounded growth.
-    # activity-log entities keep newest 50; others 200.
+    # Cap observations (activity-log: 50, others: 200)
     MAX_OBS_ACTIVITY = 50
     MAX_OBS_DEFAULT = 200
     for e in kept:
@@ -542,25 +473,18 @@ def consolidate(entities, relations):
 
 
 def stamp_metadata(entities, branch):
-    """Add _branch, _created to NEW entities only.
-
-    Only stamps _updated on entities missing it entirely
-    (first time seen). Existing _updated is preserved so
-    decay scoring works correctly.
-    """
+    """Add _branch/_created to new entities; preserve existing _updated."""
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for e in entities:
         if "_branch" not in e:
             e["_branch"] = branch
         if "_created" not in e:
             e["_created"] = now
-        # Only set _updated if missing — preserve existing
         if "_updated" not in e:
             e["_updated"] = now
     return entities
 
 
-# Stopword set for TF-IDF filtering
 _STOPWORDS = frozenset({
     "a", "an", "the", "is", "are", "was", "were", "be",
     "been", "being", "have", "has", "had", "do", "does",
@@ -580,7 +504,6 @@ _STOPWORDS = frozenset({
     "but", "and", "or", "if", "then", "else", "also",
 })
 
-# Hex/UUID noise pattern
 _RE_HEX_NOISE = re.compile(r'^[0-9a-f]{8,}$')
 
 
@@ -598,11 +521,8 @@ def _filter_token(w):
 def build_tfidf_index(entities, memory_dir):
     """Build TF-IDF index with magnitudes, postings, metadata.
 
-    Two-pass: (1) tokenize + DF, (2) TF-IDF vectors + magnitudes.
-    Stores entity metadata for self-sufficient search results.
-    Streams JSON output to reduce peak memory.
-    Filters stopwords and noise tokens.
-    Excludes terms with DF < 2 (singletons).
+    Two-pass: tokenize + DF, then TF-IDF vectors. Filters
+    stopwords and singleton terms (DF < 2 when corpus > 50).
     """
     if not entities:
         return 0
@@ -614,7 +534,6 @@ def build_tfidf_index(entities, memory_dir):
     for ent in entities:
         name = ent.get("name", "")
         obs = ent.get("observations", [])
-        # Coerce non-string observations
         obs_strs = []
         for o in obs:
             if isinstance(o, str):
@@ -622,9 +541,8 @@ def build_tfidf_index(entities, memory_dir):
             else:
                 obs_strs.append(str(o))
         etype = ent.get("entityType", "")
-        # Tokenize each component independently — avoids
-        # triple temporary string (join+concat+lower) per
-        # entity. ~1.2GB less GC pressure for 10K entities.
+        # Tokenize each component independently to reduce
+        # GC pressure (~1.2GB less for 10K entities)
         words = []
         for piece in chain((name, etype), obs_strs):
             words.extend(
@@ -647,8 +565,6 @@ def build_tfidf_index(entities, memory_dir):
         return 0
 
     n_docs = len(docs)
-    # Exclude singleton terms (DF < 2)
-    # Threshold at 50 to avoid over-filtering small corpora
     min_df = 2 if n_docs > 50 else 1
     idf = {
         w: math.log((n_docs + 1) / (count + 1)) + 1
@@ -671,15 +587,13 @@ def build_tfidf_index(entities, memory_dir):
                 vec[w] = round(score, 4)
                 postings[w].append(name)
         if not vec:
-            continue  # skip entities with no significant terms
+            continue
         vectors[name] = vec
         mag = math.sqrt(sum(v * v for v in vec.values()))
         magnitudes[name] = round(mag, 4)
 
-    # Free intermediate data before serialization
     del docs, df
 
-    # Filter metadata to indexed entities only
     meta = {k: v for k, v in meta.items() if k in vectors}
     n_indexed = len(vectors)
 
@@ -690,7 +604,7 @@ def build_tfidf_index(entities, memory_dir):
             # Stream sections to reduce peak memory
             f.write('{"vectors":')
             _dump(vectors, f)
-            del vectors  # free before next section
+            del vectors
             f.write(',"idf":')
             _dump(
                 {k: round(v, 4) for k, v in idf.items()},
@@ -787,22 +701,13 @@ def _print_graph_stats(entities, n_relations, pruned,
 
 
 def _acquire_lock(memory_dir):
-    """Acquire exclusive lock for maintenance.
-
-    Returns lock file descriptor or None if lock held.
-    Uses fcntl.flock for cross-process safety.
-    Detects stale locks older than 1 hour.
-    Uses .graph.lock (shared with MCP server) to prevent
-    concurrent rewrites from both processes.
-    """
+    """Acquire exclusive flock with 10s timeout. Returns fd or None."""
     if fcntl is None:
         return True  # Windows: no locking, return truthy
     lock_path = os.path.join(memory_dir, ".graph.lock")
     # DO NOT unlink stale lock files — flock is per-inode.
     # Unlinking + recreating gives a new inode, allowing
-    # two processes to hold "exclusive" flocks on
-    # different inodes simultaneously (TOCTOU race).
-    # Instead, use non-blocking flock with a timeout.
+    # two processes to hold "exclusive" flocks simultaneously.
     fd = None
     try:
         fd = open(lock_path, "a")
@@ -817,7 +722,6 @@ def _acquire_lock(memory_dir):
             except (IOError, OSError):
                 time.sleep(delay)
                 delay = min(delay * 2, 1.0)
-        # Timeout — could not acquire lock
         fd.close()
         return None
     except (OSError, IOError):
@@ -838,13 +742,7 @@ def _release_lock(lock_fd):
 
 
 def run(project_dir):
-    """Main maintenance routine with timing instrumentation.
-
-    Lock scope reduced — lock acquired only for write
-    phases, not for the entire read+compute cycle.
-    """
-    # Reset config to defaults before loading project overrides
-    # (prevents leaking config between calls if imported as lib)
+    """Main: stamp → prune → consolidate → rewrite → index."""
     _cfg.update(_DEFAULTS)
     memory_dir = os.path.join(project_dir, ".memory")
     _load_config(memory_dir)
@@ -863,9 +761,7 @@ def run(project_dir):
             return
 
     # --- Read + compute phase (NO lock) ---
-    # Backup before mutation — hard link (O(1)) with
-    # fallback to copy. Safe because write_jsonl uses
-    # atomic replace (new inode).
+    # Backup: hard link (O(1)) with fallback to copy
     bak_path = graph_path + ".bak"
     try:
         try:
@@ -881,7 +777,6 @@ def run(project_dir):
                 f"Maintenance: backup failed: {exc}"
             )
 
-    # Stream + partition in one pass
     try:
         entities, relations, others = partition_graph(
             graph_path
@@ -894,14 +789,14 @@ def run(project_dir):
         Path(marker).touch()
         return
 
-    # Record graph mtime before compute — detect races
+    # Record mtime before compute — detect races
     try:
         pre_mtime = os.path.getmtime(graph_path)
     except OSError:
         pre_mtime = 0.0
 
     branch = get_branch(cwd=project_dir)
-    recall_counts = load_recall_counts(memory_dir)
+    recall_counts = read_recall_counts(memory_dir)
 
     t0 = time.monotonic()
     entities = stamp_metadata(entities, branch)
@@ -922,7 +817,6 @@ def run(project_dir):
         return
 
     try:
-        # Check for concurrent modification
         try:
             post_mtime = os.path.getmtime(graph_path)
         except OSError:
@@ -930,7 +824,6 @@ def run(project_dir):
         if post_mtime != pre_mtime:
             print("Maintenance: graph modified during "
                   "compute — skipping write (will retry)")
-            # Do NOT touch marker — allow prompt retry
             return
 
         # chain() avoids allocating a merged list
@@ -951,7 +844,7 @@ def run(project_dir):
             f"merged {merged} entities"
         )
 
-    # Phase 1b: Prune stale recall counts (no lock needed)
+    # Prune stale recall counts (no lock needed)
     if recall_counts:
         live_names = {
             e.get("name", "") for e in entities
@@ -984,14 +877,12 @@ def run(project_dir):
     n_relations = len(relations)
     del recall_counts, relations
 
-    # Graph statistics (before index build so entities
-    # can be freed sooner — reduces peak memory)
+    # Stats before index (frees entities sooner)
     _print_graph_stats(
         entities, n_relations, pruned, merged, memory_dir
     )
 
-    # Extract lightweight data for index build —
-    # frees full entity dicts and extra metadata fields.
+    # Lightweight copy for index build
     index_input = [
         {"name": e.get("name", ""),
          "entityType": e.get("entityType", ""),
@@ -1001,7 +892,6 @@ def run(project_dir):
     ]
     del entities
 
-    # Phase 2: TF-IDF index (writes its own temp file)
     try:
         indexed = build_tfidf_index(
             index_input, memory_dir
@@ -1023,6 +913,31 @@ def run(project_dir):
     del index_input
 
 
+def rebuild_index(memory_dir):
+    """Rebuild TF-IDF index without throttle/prune/merge. Returns count."""
+    graph_path = os.path.join(memory_dir, "graph.jsonl")
+    if not os.path.exists(graph_path):
+        return 0
+    try:
+        entities, _, _ = partition_graph(graph_path)
+    except (OSError, MemoryError):
+        return 0
+    if not entities:
+        return 0
+    branch = get_branch(
+        cwd=os.path.dirname(memory_dir)
+    )
+    entities = stamp_metadata(entities, branch)
+    index_input = [
+        {"name": e.get("name", ""),
+         "entityType": e.get("entityType", ""),
+         "observations": e.get("observations", []),
+         "_branch": e.get("_branch", "")}
+        for e in entities
+    ]
+    return build_tfidf_index(index_input, memory_dir)
+
+
 if __name__ == "__main__":
     proj = (
         sys.argv[1]
@@ -1031,4 +946,10 @@ if __name__ == "__main__":
             "CLAUDE_PROJECT_DIR", os.getcwd()
         )
     )
-    run(proj)
+    mem_dir = os.path.join(proj, ".memory")
+    if not os.path.isdir(mem_dir):
+        print(
+            f"Maintenance: skipped — no .memory/ in {proj}"
+        )
+    else:
+        run(proj)

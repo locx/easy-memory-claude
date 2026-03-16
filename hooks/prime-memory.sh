@@ -34,7 +34,7 @@ if [ -f "${SCRIPT_DIR}/smart_recall.py" ]; then
     python3 "${SCRIPT_DIR}/smart_recall.py" "${MEMORY_DIR}" 2>/dev/null
 else
     # Fallback if smart_recall.py missing
-    echo "Memory tools: semantic_search_memory | traverse_relations | create_entities"
+    echo "Memory tools: semantic_search_memory | traverse_relations | create_entities | create_decision | graph_stats"
 fi
 
 exit 0

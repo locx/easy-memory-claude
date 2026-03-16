@@ -61,42 +61,37 @@ else
     echo "  [skip] ${GRAPH_FILE} — already exists"
 fi
 
-# ---- 4. Remove memory MCP servers from .mcp.json ----
+# ---- 4 & 5. Remove memory MCP servers from .mcp.json and .vscode/mcp.json ----
 # VSCode extension spawns MCP servers on session start, causing
 # multi-second delay with zero benefit (tools don't work).
 # CLI bridge in CLAUDE.md covers both CLI and VSCode.
-MCP_ROOT="${PROJECT_DIR}/.mcp.json"
-if [ -f "${MCP_ROOT}" ]; then
-    python3 - "${MCP_ROOT}" << 'PYEOF'
+_remove_memory_servers() {
+    local MCP_FILE="$1" SERVER_KEY="$2" LABEL="$3"
+    if [ ! -f "${MCP_FILE}" ]; then
+        echo "  [skip] ${LABEL} — not present"
+        return
+    fi
+    python3 - "${MCP_FILE}" "${SERVER_KEY}" "${LABEL}" << 'PYEOF'
 import json, sys, os
 
-mcp_path = sys.argv[1]
+mcp_path, server_key, label = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     with open(mcp_path, encoding='utf-8') as f:
         cfg = json.load(f)
 except (json.JSONDecodeError, ValueError, OSError):
     sys.exit(0)
 
-servers = cfg.get('mcpServers', {})
-removed = []
-for key in list(servers.keys()):
-    s = servers[key]
-    if not isinstance(s, dict):
-        continue
-    env = s.get('env', {})
-    args = s.get('args', [])
-    cmd = s.get('command', '')
-    if ('MEMORY_DIR' in env or 'semantic_server' in str(args)
-            or (cmd == 'npx' and 'server-memory' in str(args))
-            or key in ('memory', 'memory-search',
-                       'memory-semantic-search')):
-        removed.append(key)
-        del servers[key]
-
+servers = cfg.get(server_key, {})
+removed = [k for k, s in servers.items() if isinstance(s, dict) and (
+    'MEMORY_DIR' in s.get('env', {})
+    or 'semantic_server' in str(s.get('args', []))
+    or (s.get('command') == 'npx' and 'server-memory' in str(s.get('args', [])))
+    or k in ('memory', 'memory-search', 'memory-semantic-search'))]
+for k in removed:
+    del servers[k]
 if not removed:
-    print('  [skip] .mcp.json — no memory servers to remove')
+    print(f'  [skip] {label} — no memory servers to remove')
     sys.exit(0)
-
 if servers:
     tmp = mcp_path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
@@ -107,64 +102,13 @@ if servers:
     os.replace(tmp, mcp_path)
 else:
     os.unlink(mcp_path)
-
 for k in removed:
-    print(f'  [removed] .mcp.json — "{k}" (causes VSCode startup delay)')
+    print(f'  [removed] {label} — "{k}" (causes VSCode startup delay)')
 PYEOF
-else
-    echo "  [skip] .mcp.json — not present"
-fi
+}
 
-# ---- 5. Remove .vscode/mcp.json memory server if present ----
-# VSCode extension spawns MCP servers on session start even though
-# it can't use the tools (known bug). This adds seconds of delay.
-# CLAUDE.md CLI bridge covers both CLI and VSCode.
-MCP_VSCODE="${VSCODE_DIR}/mcp.json"
-if [ -f "${MCP_VSCODE}" ]; then
-    python3 - "${MCP_VSCODE}" << 'PYEOF'
-import json, sys, os
-
-mcp_path = sys.argv[1]
-try:
-    with open(mcp_path, encoding='utf-8') as f:
-        cfg = json.load(f)
-except (json.JSONDecodeError, ValueError, OSError):
-    sys.exit(0)
-
-servers = cfg.get('servers', {})
-removed = []
-for key in list(servers.keys()):
-    s = servers[key]
-    if not isinstance(s, dict):
-        continue
-    env = s.get('env', {})
-    args = s.get('args', [])
-    if ('MEMORY_DIR' in env or 'semantic_server' in str(args)
-            or key in ('memory', 'memory-search',
-                       'memory-semantic-search')):
-        removed.append(key)
-        del servers[key]
-
-if not removed:
-    sys.exit(0)
-
-if servers:
-    tmp = mcp_path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=2)
-        f.write('\n')
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, mcp_path)
-else:
-    os.unlink(mcp_path)
-
-for k in removed:
-    print(f'  [removed] .vscode/mcp.json — "{k}" (causes startup delay)')
-PYEOF
-else
-    echo "  [skip] .vscode/mcp.json — not present"
-fi
+_remove_memory_servers "${PROJECT_DIR}/.mcp.json" "mcpServers" ".mcp.json"
+_remove_memory_servers "${VSCODE_DIR}/mcp.json" "servers" ".vscode/mcp.json"
 
 # ---- 6. Add .memory/ to .gitignore ----
 if [ -f "${GITIGNORE}" ]; then

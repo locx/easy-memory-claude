@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """PostToolUse hook: capture observations + surface warnings.
 
-On Edit/Write: checks graph for file-specific warnings and
-related entities, outputs them to stdout for the agent.
-Also logs activity to graph.pending sidecar.
-
-On Bash: logs command to activity sidecar.
-
 Usage: python3 capture_tool_context.py <input_json> <graph_path>
 """
 import json
@@ -16,35 +10,20 @@ import time
 
 
 def _check_file_warnings(graph_path, filename, session_id):
-    """Check graph for warnings/decisions about a file.
-
-    Scans graph.jsonl for entities matching the filename
-    with entityType 'file-warning' or observations
-    containing [WARNING]. Also finds related decisions
-    and dependencies via relations.
-
-    Returns formatted warning string or empty string.
-    Uses session marker to avoid repeating warnings.
-    """
+    """Check graph for warnings/decisions about a file."""
     if not filename or filename == '?':
         return ""
 
-    # Per-file per-session dedup — use basename only
-    # to avoid path traversal in marker filename
     safe_sid = "".join(
         c if c.isalnum() or c in ('_', '-')
         else '_' for c in session_id
     )[:64]
     safe_file = os.path.basename(filename)[:64]
-    marker = (
-        f"/tmp/.claude-mem-warned-"
-        f"{safe_sid}-{safe_file}"
-    )
+    marker = f"/tmp/.claude-mem-warned-{safe_sid}-{safe_file}"
     if os.path.exists(marker):
         return ""
 
     basename = os.path.basename(filename)
-    # Also try relative path matching
     match_names = {basename, filename}
 
     warnings = []
@@ -69,24 +48,17 @@ def _check_file_warnings(graph_path, filename, session_id):
                         name = obj.get("name", "")
                         etype = obj.get("entityType", "")
                         obs = obj.get("observations", [])
-                        # File warnings
-                        if name in match_names \
-                                and etype == "file-warning":
+                        if name in match_names:
                             for o in obs:
-                                if isinstance(o, str):
+                                if not isinstance(o, str):
+                                    continue
+                                if (etype == "file-warning"
+                                        or "[WARNING]" in o):
                                     warnings.append(o)
-                        # Any entity with WARNING obs
-                        # about this file
-                        elif name in match_names:
-                            for o in obs:
-                                if isinstance(o, str) \
-                                        and "[WARNING]" in o:
-                                    warnings.append(o)
-                        # Decisions scoped to this file
                         elif etype == "decision":
                             for o in obs:
-                                if isinstance(o, str) \
-                                        and basename in o:
+                                if (isinstance(o, str)
+                                        and basename in o):
                                     short = name
                                     if short.startswith(
                                         "decision: "
@@ -97,17 +69,14 @@ def _check_file_warnings(graph_path, filename, session_id):
                     elif t == "relation":
                         fr = obj.get("from", "")
                         to = obj.get("to", "")
-                        rt = obj.get(
-                            "relationType", ""
-                        )
+                        rt = obj.get("relationType", "")
                         if fr in match_names:
                             relations_out.append(
                                 f"{rt} -> {to}"
                             )
                         elif to in match_names:
                             relations_out.append(
-                                f"{fr} -{rt}-> "
-                                f"{basename}"
+                                f"{fr} -{rt}-> {basename}"
                             )
                 except (json.JSONDecodeError, ValueError):
                     continue
@@ -118,7 +87,6 @@ def _check_file_warnings(graph_path, filename, session_id):
             and not relations_out:
         return ""
 
-    # Mark as shown for this session
     try:
         with open(marker, 'w') as f:
             f.write('1')
@@ -126,18 +94,15 @@ def _check_file_warnings(graph_path, filename, session_id):
         pass
 
     parts = []
-    if warnings:
-        parts.append(f"Warnings for {basename}:")
-        for w in warnings[:5]:
-            parts.append(f"  - {w[:200]}")
-    if decisions:
-        parts.append(f"Related decisions:")
-        for d in decisions[:3]:
-            parts.append(f"  - {d}")
-    if relations_out:
-        parts.append(f"Relations:")
-        for r in relations_out[:5]:
-            parts.append(f"  - {r}")
+    for items, header, limit in (
+        (warnings, f"Warnings for {basename}:", 5),
+        (decisions, "Related decisions:", 3),
+        (relations_out, "Relations:", 5),
+    ):
+        if items:
+            parts.append(header)
+            for item in items[:limit]:
+                parts.append(f"  - {item[:200]}")
 
     return "\n".join(parts)
 
@@ -156,9 +121,9 @@ def main():
 
     tool = data.get('tool_name', '')
     if tool not in ('Edit', 'Write', 'Bash', 'NotebookEdit'):
-        sys.exit(2)  # non-matching — don't update marker
+        sys.exit(2)
 
-    # --- File warnings (Edit/Write only) ---
+    # File warnings (Edit/Write only)
     file_path = None
     if tool in ('Edit', 'Write'):
         file_path = data.get('tool_input', {}).get(
@@ -173,7 +138,7 @@ def main():
         if warning_text:
             print(warning_text)
 
-    # --- Activity logging ---
+    # Activity logging
     if tool in ('Edit', 'Write'):
         base = os.path.basename(file_path or '?')
         verb = 'Edited' if tool == 'Edit' \
@@ -199,26 +164,33 @@ def main():
         '_updated': ts,
     }, separators=(',', ':'))
 
-    # Write to sidecar buffer — no lock needed.
     pending_path = graph_path + ".pending"
     try:
         with open(pending_path, 'a', encoding="utf-8") as f:
             f.write(entry + '\n')
             f.flush()
     except OSError:
-        _write_direct(graph_path, entry)
+        if not _write_direct(graph_path, entry):
+            print(
+                "Warning: observation lost — both sidecar "
+                "and direct write failed",
+                file=sys.stderr,
+            )
 
 
 def _write_direct(graph_path, entry):
     """Fallback: locked append to graph.jsonl."""
     try:
         import fcntl
-        lock_path = os.path.join(
-            os.path.dirname(graph_path), '.graph.lock'
-        )
-        lock_fd = open(lock_path, 'a')
+    except ImportError:
+        fcntl = None
+    lock_path = os.path.join(
+        os.path.dirname(graph_path), '.graph.lock'
+    )
+    acquired = False
+    if fcntl is not None:
         try:
-            acquired = False
+            lock_fd = open(lock_path, 'a')
             delay = 0.025
             for _ in range(5):
                 try:
@@ -233,30 +205,26 @@ def _write_direct(graph_path, entry):
                     delay *= 2
             if not acquired:
                 lock_fd.close()
-                return
-            with open(
-                graph_path, 'a', encoding="utf-8"
-            ) as f:
-                f.write(entry + '\n')
-                f.flush()
-                os.fsync(f.fileno())
-        finally:
-            if acquired:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            lock_fd.close()
-    except ImportError:
-        try:
-            with open(
-                graph_path, 'a', encoding="utf-8"
-            ) as f:
-                f.write(entry + '\n')
+                return False
         except OSError:
-            pass
+            return False
+    try:
+        with open(
+            graph_path, 'a', encoding="utf-8"
+        ) as f:
+            f.write(entry + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+        return True
     except OSError:
-        pass
+        return False
+    finally:
+        if acquired and fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+            except OSError:
+                pass
 
 
 if __name__ == '__main__':

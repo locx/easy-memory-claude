@@ -2,7 +2,6 @@
 
 from .config import MAX_CACHE_BYTES
 
-# --- Module-level caches ---
 index_cache = {
     "data": None, "mtime": 0.0, "path": "", "size": 0,
 }
@@ -13,13 +12,11 @@ entity_cache = {
 relation_cache = {
     "data": None, "mtime": 0.0, "path": "", "size": 0,
 }
-# Cached adjacency lists (invalidated with relation cache)
 adjacency_cache = {
     "outbound": None, "inbound": None,
     "mtime": 0.0, "size": 0,
 }
 
-# Throttle cooperative index reload stat check
 last_index_check = 0.0
 
 
@@ -46,11 +43,7 @@ def clear_relation_cache():
 
 
 def estimate_size(obj):
-    """Estimate byte size for eviction decisions.
-
-    Uses entry count * avg overhead. Avoids json.dumps
-    which creates a transient copy of the full dataset.
-    """
+    """Estimate byte size via entry count * avg overhead."""
     if obj is None:
         return 0
     if isinstance(obj, dict):
@@ -60,19 +53,14 @@ def estimate_size(obj):
     return 64
 
 
-def maybe_evict_caches():
-    """Evict caches in priority order until under cap.
+def _cache_total():
+    return (index_cache["size"] + entity_cache["size"]
+            + relation_cache["size"] + adjacency_cache["size"])
 
-    Priority: index (largest, rebuilt by maint) ->
-    adjacency -> entity -> relation.
-    """
-    total = (
-        index_cache["size"]
-        + entity_cache["size"]
-        + relation_cache["size"]
-        + adjacency_cache["size"]
-    )
-    if total <= MAX_CACHE_BYTES:
+
+def maybe_evict_caches():
+    """Evict caches in priority order until under cap."""
+    if _cache_total() <= MAX_CACHE_BYTES:
         return
     for cache, clear_fn in (
         (index_cache, clear_index_cache),
@@ -85,11 +73,5 @@ def maybe_evict_caches():
     ):
         if cache["size"] > 0:
             clear_fn()
-            total = (
-                index_cache["size"]
-                + entity_cache["size"]
-                + relation_cache["size"]
-                + adjacency_cache["size"]
-            )
-            if total <= MAX_CACHE_BYTES:
+            if _cache_total() <= MAX_CACHE_BYTES:
                 return

@@ -9,7 +9,7 @@ from .config import (
     reset_session_stats, log_event, refresh_branch,
 )
 from .graph import load_index
-from .recall import load_recall_counts
+from .recall import init_recall_state
 from .search import search, search_by_time
 from .tools import (
     add_observations,
@@ -18,6 +18,9 @@ from .tools import (
     create_relations,
     delete_entities,
     graph_stats,
+    list_decisions,
+    remove_observations,
+    rename_entity,
     update_decision_outcome,
 )
 from .traverse import traverse_relations
@@ -45,7 +48,7 @@ def handle_message(msg, memory_dir):
         reset_session_stats()
         refresh_branch()
         load_index(memory_dir)
-        load_recall_counts(memory_dir)
+        init_recall_state(memory_dir)
         log_event("INIT", "session started")
         return {
             "jsonrpc": "2.0",
@@ -97,6 +100,9 @@ def handle_message(msg, memory_dir):
                     branch_filter=args.get(
                         "branch_filter"
                     ),
+                    entity_type=args.get(
+                        "entity_type"
+                    ),
                 )
             elif tool_name == "create_entities":
                 result = create_entities(
@@ -126,6 +132,20 @@ def handle_message(msg, memory_dir):
             elif tool_name == "update_decision_outcome":
                 result = update_decision_outcome(
                     args, memory_dir,
+                )
+            elif tool_name == "list_decisions":
+                result = list_decisions(memory_dir)
+            elif tool_name == "remove_observations":
+                result = remove_observations(
+                    args.get("entity", ""),
+                    args.get("observations", []),
+                    memory_dir,
+                )
+            elif tool_name == "rename_entity":
+                result = rename_entity(
+                    args.get("old_name", ""),
+                    args.get("new_name", ""),
+                    memory_dir,
                 )
             elif tool_name == "graph_stats":
                 result = graph_stats(memory_dir)

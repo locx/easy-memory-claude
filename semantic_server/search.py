@@ -24,21 +24,14 @@ from .recall import (
 
 
 def _branch_boost(entity_branch, current_branch, sim):
-    """Smooth branch relevance factor.
-
-    Returns 1.0 for same-branch or unknown. For other
-    branches, penalty increases as sim decreases —
-    no hard cliff.
-    """
+    """Smooth branch relevance factor (no hard cliff)."""
     if (not entity_branch or not current_branch
             or entity_branch == current_branch):
         return 1.0
-    # Base penalty: 0.05 for main, 0.20 for other
     if entity_branch in MAIN_BRANCHES:
         max_penalty = 0.05
     else:
         max_penalty = 0.20
-    # Smooth: penalty scales with (1 - sim)
     penalty = max_penalty * (1.0 - min(sim, 1.0))
     return 1.0 - penalty
 
@@ -61,24 +54,18 @@ def _enrich_results(results, source,
 
 
 def search(query, memory_dir, top_k=5, branch=None):
-    """Search memory graph using TF-IDF cosine similarity.
-
-    branch: override branch for boost (default:
-    auto-detected current branch).
-    """
+    """Search memory graph using TF-IDF cosine similarity."""
     _t0 = _time.monotonic()
     if not isinstance(query, str):
         query = str(query) if query is not None else ""
     if len(query) > MAX_QUERY_CHARS:
         query = query[:MAX_QUERY_CHARS]
-    if (isinstance(top_k, bool)
-            or not isinstance(top_k, int) or top_k < 1):
+    if not isinstance(top_k, int) or top_k < 1:
         top_k = 5
     top_k = min(top_k, MAX_TOP_K)
 
     current_branch = branch or get_current_branch()
 
-    # Reload recall counts if changed externally
     maybe_reload_recall_counts()
 
     idx = load_index(memory_dir)
@@ -153,7 +140,6 @@ def search(query, memory_dir, top_k=5, branch=None):
     else:
         candidates = set(vectors.keys())
 
-    # Heap: (adj_sim, raw_sim, boost, name)
     heap = []
     for name in candidates:
         vec = vectors.get(name)
@@ -175,8 +161,6 @@ def search(query, memory_dir, top_k=5, branch=None):
             continue
         sim = dot / (mag_q * mag_b)
         if sim > 0.001 and math.isfinite(sim):
-            # Branch boost — index metadata first,
-            # then entity cache
             entity_branch = ""
             meta_entry = metadata.get(name)
             if meta_entry:
@@ -213,7 +197,6 @@ def search(query, memory_dir, top_k=5, branch=None):
     ]
 
     if results:
-        # Prefer entity cache → index metadata → graph
         if _ec["data"] is not None:
             source = _ec["data"]
         elif isinstance(metadata, dict) and metadata:
@@ -240,16 +223,15 @@ def search(query, memory_dir, top_k=5, branch=None):
 
 
 def search_by_time(memory_dir, since=None, until=None,
-                   limit=20, branch_filter=None):
-    """Return entities within a time window, sorted by
-    recency. Optionally filter to a specific branch."""
+                   limit=20, branch_filter=None,
+                   entity_type=None):
+    """Return entities within a time window, sorted by recency."""
     try:
         limit = min(max(int(limit), 1), MAX_TOP_K)
     except (ValueError, TypeError):
         limit = 20
     entities = load_graph_entities(memory_dir)
 
-    # Normalize only the query bounds
     since_n = _normalize_iso_ts(since) if since else None
     until_n = _normalize_iso_ts(until) if until else None
 
@@ -267,6 +249,10 @@ def search_by_time(memory_dir, since=None, until=None,
         if (branch_filter
                 and info.get("_branch", "")
                 != branch_filter):
+            continue
+        if (entity_type
+                and info.get("entityType", "")
+                != entity_type):
             continue
         candidates.append((ts, name))
 
