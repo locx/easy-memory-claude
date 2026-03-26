@@ -47,7 +47,7 @@ def estimate_size(obj):
     if obj is None:
         return 0
     if isinstance(obj, dict):
-        return len(obj) * 500
+        return len(obj) * 2000
     if isinstance(obj, list):
         return len(obj) * 200
     return 64

@@ -304,42 +304,52 @@ fi
 
 # ---- 8. Add/update memory plugin instructions in CLAUDE.md ----
 CLAUDE_MD="${PROJECT_DIR}/CLAUDE.md"
-MEMORY_MARKER="## Memory Graph Plugin"
+MEMORY_MARKER="## Memory Graph"
 
 MEMORY_SECTION='
-## Memory Graph Plugin
+## Memory Graph
 
-Knowledge graph at `.memory/`. All tools via Bash CLI bridge. Inline this full prefix in every Bash call (shell state does not persist between calls):
+Knowledge graph at `.memory/`. CLI prefix (inline every call — state does not persist):
 
-    MEMORY_DIR=$PWD/.memory PYTHONPATH=~/.claude/memory python3 ~/.claude/memory/memory-cli.py
+    MEMORY_DIR=$(git rev-parse --show-toplevel)/.memory PYTHONPATH=~/.claude/memory python3 ~/.claude/memory/memory-cli.py
 
-Tools: graph_stats, semantic_search_memory, create_decision, update_decision_outcome, create_entities, create_relations, add_observations, delete_entities, traverse_relations, search_memory_by_time
+Agents: Discover commands: `<prefix> --help`. Always include this prefix verbatim in agent prompts. `git rev-parse --show-toplevel` resolves the repo root dynamically — safe from any subdirectory or worktree. Never use `$PWD`.
 
-**Mandatory behavior — do silently, never ask permission:**
-- Before editing unfamiliar code → run `semantic_search_memory` for prior context
-- After choosing between approaches → run `create_decision` with title, rationale, scope
-- When finding fragile/surprising code → run `create_entities` with entityType `file-warning`
-- After revisiting a prior decision → run `update_decision_outcome` with lesson learned
-- After creating related entities → run `create_relations` to link them
+**Fire autonomously — no permission needed, do announcement:**
 
-These are autonomous actions like reading a file before editing it. Never ask "want me to record this?" — just do it.'
+| When | Action |
+|------|--------|
+| Unfamiliar code | `semantic_search_memory` |
+| Chose approach A over B | `create_decision` — title, rationale, scope |
+| New module/file | `create_decision` — why this structure |
+| Security fix | `create_decision` — threat + mitigation |
+| Revisited decision | `update_decision_outcome` — lesson |
+| New observations on entity | `add_observations` — incremental update |
+| Fragile/surprising code | `create_entities` (file-warning) — risk |
+| Related entities | `create_relations` — link them |
+
+> Major task + ≥1 architectural choice + no `create_decision` = incomplete. You MUST run create_decision before claiming the task is done.
+
+**Stale decision hygiene:** At conversation start, run `list_decisions`. If any pending decisions are older than 2 days, surface the top 5 oldest and ask the user to resolve them (successful / failed / adopted / obsolete) before starting the main task.'
 
 if [ ! -f "${CLAUDE_MD}" ]; then
     echo "  [skip] No CLAUDE.md found — memory instructions not added"
     echo "         Create a CLAUDE.md and re-run, or add manually"
-elif grep -q "${MEMORY_MARKER}" "${CLAUDE_MD}" 2>/dev/null; then
+elif grep -qE '## Memory Graph( Plugin)?' "${CLAUDE_MD}" 2>/dev/null; then
     # Replace existing section: strip old, append new
     python3 - "${CLAUDE_MD}" << 'PYEOF'
-import sys
+import sys, re
 
 path = sys.argv[1]
-marker = "## Memory Graph Plugin"
 with open(path, encoding="utf-8") as f:
     content = f.read()
 
-start = content.find(marker)
-if start < 0:
+# Match both old "## Memory Graph Plugin" and new "## Memory Graph"
+m = re.search(r'^## Memory Graph( Plugin)?', content, re.MULTILINE)
+if not m:
     sys.exit(0)
+start = m.start()
+marker = m.group(0)
 
 # Find end: next ## heading or EOF
 end = content.find("\n## ", start + len(marker))
@@ -372,9 +382,12 @@ echo ""
 echo "  Graph:    ${GRAPH_FILE}"
 echo "  Access:   CLI bridge (Bash) — works in both CLI and VSCode"
 echo ""
-echo "  10 tools available:"
+echo "  13 tools available:"
 echo "    semantic_search_memory, traverse_relations,"
 echo "    search_memory_by_time, create_entities,"
-echo "    create_relations, add_observations, delete_entities,"
-echo "    create_decision, update_decision_outcome, graph_stats"
+echo "    create_relations, add_observations,"
+echo "    remove_observations, delete_entities,"
+echo "    rename_entity, create_decision,"
+echo "    update_decision_outcome, list_decisions,"
+echo "    graph_stats"
 echo "============================================================"

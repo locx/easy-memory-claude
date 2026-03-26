@@ -134,7 +134,10 @@ def handle_message(msg, memory_dir):
                     args, memory_dir,
                 )
             elif tool_name == "list_decisions":
-                result = list_decisions(memory_dir)
+                result = list_decisions(
+                    memory_dir,
+                    stale_days=args.get("stale_days"),
+                )
             elif tool_name == "remove_observations":
                 result = remove_observations(
                     args.get("entity", ""),

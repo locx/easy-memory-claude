@@ -335,7 +335,9 @@ def consolidate(entities, relations):
     merged_count = 0
     absorbed = set()
     renames = {}
-    WINDOW = 20
+    WINDOW = 20 if n < 5000 else 10
+    _MAX_COMPARISONS = 500_000
+    total_comparisons = 0
 
     for pos in range(n):
         etype_i, norm_i, idx_i = keyed[pos]
@@ -348,7 +350,10 @@ def consolidate(entities, relations):
         obs_dict_i = None
         len_i = len(norm_i)
 
+        if total_comparisons > _MAX_COMPARISONS:
+            break
         for ahead in range(1, WINDOW + 1):
+            total_comparisons += 1
             j = pos + ahead
             if j >= n:
                 break
@@ -741,12 +746,64 @@ def _release_lock(lock_fd):
             pass
 
 
+def _do_pending_merge(merging, graph_path):
+    """Append .merging file contents into graph.jsonl, then unlink it.
+
+    If append succeeds but unlink fails, truncate to
+    prevent re-appending the same data.
+    """
+    try:
+        with open(merging, "rb") as src:
+            data = src.read()
+        if not data:
+            os.unlink(merging)
+            return
+        if not data.endswith(b"\n"):
+            data += b"\n"
+        with open(graph_path, "ab") as dst:
+            dst.write(data)
+            dst.flush()
+            os.fsync(dst.fileno())
+        try:
+            os.unlink(merging)
+        except OSError:
+            try:
+                with open(merging, "w"):
+                    pass
+            except OSError:
+                pass
+    except OSError:
+        pass  # pre-append failure — orphan stays
+
+
+def _merge_pending_file(memory_dir, graph_path):
+    """Merge .pending sidecar into graph.jsonl.
+
+    Recovers orphaned .merging/.processing from crash.
+    """
+    pending = graph_path + ".pending"
+    merging = pending + ".merging"
+    processing = pending + ".processing"
+
+    # Only recover .merging — .processing is owned by
+    # the MCP server process (server.py)
+    if os.path.exists(merging):
+        _do_pending_merge(merging, graph_path)
+
+    try:
+        os.rename(pending, merging)
+    except OSError:
+        return
+    _do_pending_merge(merging, graph_path)
+
+
 def run(project_dir):
     """Main: stamp → prune → consolidate → rewrite → index."""
     _cfg.update(_DEFAULTS)
     memory_dir = os.path.join(project_dir, ".memory")
     _load_config(memory_dir)
     graph_path = os.path.join(memory_dir, "graph.jsonl")
+    _merge_pending_file(memory_dir, graph_path)
     marker = os.path.join(memory_dir, ".last-maintenance")
 
     if not os.path.exists(graph_path):

@@ -3,6 +3,7 @@
 Includes: create, update, delete entities/relations,
 create_decision, update_decision_outcome, graph_stats.
 """
+import calendar
 import os
 import time
 from collections import Counter
@@ -301,7 +302,7 @@ def delete_entities(entity_names, memory_dir,
             "error": "Write failed (lock timeout)",
             "deleted": 0,
         }
-    invalidate_caches()
+    # rewrite_graph already calls invalidate_caches()
 
     n_del = len(to_delete)
     n_rels = len(rels) - len(kept_rels)
@@ -354,7 +355,7 @@ def create_decision(args, memory_dir):
     outcome = args.get("outcome", "pending")
     if outcome not in (
         "pending", "successful", "failed", "revised",
-        "adopted", "rejected", "deferred",
+        "adopted", "rejected", "deferred", "obsolete",
     ):
         outcome = "pending"
     obs.append(f"Outcome: {outcome}")
@@ -419,6 +420,7 @@ def update_decision_outcome(args, memory_dir):
     _valid_outcomes = (
         "successful", "failed", "revised",
         "adopted", "rejected", "deferred",
+        "obsolete",
     )
     if outcome not in _valid_outcomes:
         return {
@@ -558,9 +560,22 @@ def graph_stats(memory_dir):
     return result
 
 
-def list_decisions(memory_dir):
-    """List all decisions with status."""
+def list_decisions(memory_dir, stale_days=None):
+    """List all decisions with status.
+
+    Args:
+        stale_days: If set, return only pending decisions
+            older than this many days (stale hygiene).
+            stale_days=0 returns all pending decisions.
+    """
+    if stale_days is not None:
+        try:
+            stale_days = max(0, float(stale_days))
+        except (TypeError, ValueError):
+            return {"error": "stale_days must be a number"}
+
     entities = load_graph_entities(memory_dir)
+    now_ts = time.time()
     decisions = []
     for name, info in entities.items():
         if info.get("entityType") != "decision":
@@ -568,8 +583,25 @@ def list_decisions(memory_dir):
         obs = info.get("observations", [])
         outcome = "pending"
         for o in obs:
-            if isinstance(o, str) and o.startswith("Outcome: "):
+            if isinstance(o, str) \
+                    and o.startswith("Outcome: "):
                 outcome = o[9:]
+        updated = info.get("_updated", "")
+
+        if stale_days is not None:
+            if outcome != "pending":
+                continue
+            if updated:
+                try:
+                    ut = calendar.timegm(time.strptime(
+                        updated[:19], "%Y-%m-%dT%H:%M:%S"
+                    ))
+                    age = (now_ts - ut) / 86400
+                    if age < stale_days:
+                        continue
+                except (ValueError, OverflowError):
+                    pass
+
         display = name
         if display.startswith(_DECISION_PREFIX):
             display = display[len(_DECISION_PREFIX):]
@@ -577,9 +609,13 @@ def list_decisions(memory_dir):
             "title": display,
             "outcome": outcome,
             "observations": obs[:5],
-            "updated": info.get("_updated", ""),
+            "updated": updated,
         })
-    decisions.sort(key=lambda d: d["updated"], reverse=True)
+    # Newest first by default; oldest first for stale hygiene
+    decisions.sort(
+        key=lambda d: d["updated"],
+        reverse=(stale_days is None),
+    )
     return {"decisions": decisions, "total": len(decisions)}
 
 
@@ -618,7 +654,7 @@ def remove_observations(entity_name, observations,
         rewrite_graph(memory_dir, updated, rels)
     except OSError:
         return {"error": "Write failed (lock timeout)"}
-    invalidate_caches()
+    # rewrite_graph already calls invalidate_caches()
     log_event("REMOVE_OBS",
               f'entity="{entity_name}" removed={removed}')
     return {"removed": removed}
@@ -662,7 +698,7 @@ def rename_entity(old_name, new_name, memory_dir):
         rewrite_graph(memory_dir, updated, fixed_rels)
     except OSError:
         return {"error": "Write failed (lock timeout)"}
-    invalidate_caches()
+    # rewrite_graph already calls invalidate_caches()
     log_event("RENAME",
               f'"{old_name}" -> "{new_name}"')
     return {"renamed": old_name, "to": new_name,

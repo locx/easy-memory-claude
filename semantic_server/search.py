@@ -203,7 +203,7 @@ def search(query, memory_dir, top_k=5, branch=None):
             source = metadata
         else:
             source = load_graph_entities(memory_dir)
-        _enrich_results(results, source, MAX_CACHED_OBS)
+        _enrich_results(results, source, min(5, MAX_CACHED_OBS))
 
     if results:
         record_recalls([r["entity"] for r in results])
@@ -270,7 +270,7 @@ def search_by_time(memory_dir, since=None, until=None,
             "created": info.get("_created", ""),
             "_branch": info.get("_branch", ""),
             "observations": (
-                obs[:MAX_CACHED_OBS]
+                obs[:min(5, MAX_CACHED_OBS)]
                 if isinstance(obs, list) else []
             ),
         })

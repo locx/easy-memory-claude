@@ -8,6 +8,9 @@ import os
 import sys
 import time
 
+_MAX_PENDING_BYTES = 1_000_000
+_WARN_SCAN_LINE_BUDGET = 5_000
+
 
 def _check_file_warnings(graph_path, filename, session_id):
     """Check graph for warnings/decisions about a file."""
@@ -19,7 +22,9 @@ def _check_file_warnings(graph_path, filename, session_id):
         else '_' for c in session_id
     )[:64]
     safe_file = os.path.basename(filename)[:64]
-    marker = f"/tmp/.claude-mem-warned-{safe_sid}-{safe_file}"
+    marker = (
+        f"/tmp/.claude-mem-warned-{safe_sid}-{safe_file}"
+    )
     if os.path.exists(marker):
         return ""
 
@@ -29,6 +34,7 @@ def _check_file_warnings(graph_path, filename, session_id):
     warnings = []
     decisions = []
     relations_out = []
+    line_count = 0
 
     try:
         with open(
@@ -36,6 +42,9 @@ def _check_file_warnings(graph_path, filename, session_id):
             errors="replace",
         ) as f:
             for line in f:
+                line_count += 1
+                if line_count > _WARN_SCAN_LINE_BUDGET:
+                    break
                 line = line.strip()
                 if not line:
                     continue
@@ -165,6 +174,12 @@ def main():
     }, separators=(',', ':'))
 
     pending_path = graph_path + ".pending"
+    try:
+        if os.path.getsize(pending_path) \
+                >= _MAX_PENDING_BYTES:
+            return
+    except OSError:
+        pass
     try:
         with open(pending_path, 'a', encoding="utf-8") as f:
             f.write(entry + '\n')

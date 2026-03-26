@@ -70,6 +70,72 @@ def _usage():
     sys.exit(1)
 
 
+def _do_merge(merging, graph):
+    """Read merging file, append to graph, delete merging.
+
+    If append succeeds but unlink fails, truncate the
+    file to prevent re-appending the same data.
+    """
+    try:
+        with open(merging, "rb") as src:
+            data = src.read()
+        if not data:
+            os.unlink(merging)
+            return
+        if not data.endswith(b"\n"):
+            data += b"\n"
+        with open(graph, "ab") as dst:
+            dst.write(data)
+            dst.flush()
+            os.fsync(dst.fileno())
+        # Data is in graph — safe to remove source
+        try:
+            os.unlink(merging)
+        except OSError:
+            # Unlink failed — truncate to prevent
+            # re-append on next recovery cycle
+            try:
+                with open(merging, "w"):
+                    pass
+            except OSError:
+                pass
+    except OSError:
+        pass  # pre-append failure — orphan stays
+
+
+def _merge_pending(memory_dir):
+    """Merge .pending sidecar into graph.jsonl.
+
+    Atomic rename prevents TOCTOU with concurrent hook
+    writers — new writes go to a fresh .pending file.
+    Recovers orphaned .merging/.processing from crash.
+    """
+    pending = os.path.join(
+        memory_dir, "graph.jsonl.pending"
+    )
+    merging = pending + ".merging"
+    graph = os.path.join(memory_dir, "graph.jsonl")
+
+    # Only recover .merging — .processing is owned by
+    # the MCP server process (server.py)
+    if os.path.exists(merging):
+        _do_merge(merging, graph)
+
+    try:
+        os.rename(pending, merging)
+    except OSError:
+        return
+    _do_merge(merging, graph)
+
+
+_WRITE_TOOLS = frozenset({
+    "create_entities", "create_relations",
+    "add_observations", "remove_observations",
+    "delete_entities", "rename_entity",
+    "create_decision", "update_decision_outcome",
+})
+
+
 def main():
     memory_dir, args = _resolve_memory_dir(sys.argv[1:])
 
@@ -101,6 +167,9 @@ def main():
         )
         sys.exit(1)
 
+    # Merge pending sidecar before any reads
+    _merge_pending(memory_dir)
+
     if tool_name == "rebuild_index":
         import maintenance
         indexed = maintenance.rebuild_index(memory_dir)
@@ -125,7 +194,10 @@ def main():
     )
     from semantic_server.traverse import traverse_relations
     from semantic_server.graph import load_index
-    from semantic_server.recall import init_recall_state
+    from semantic_server.recall import (
+        init_recall_state,
+        flush_recall_counts,
+    )
 
     try:
         load_index(memory_dir)
@@ -192,7 +264,8 @@ def main():
             update_decision_outcome(a, memory_dir)
         ),
         "list_decisions": lambda a: list_decisions(
-            memory_dir
+            memory_dir,
+            stale_days=a.get("stale_days"),
         ),
         "graph_stats": lambda a: graph_stats(memory_dir),
     }
@@ -214,6 +287,24 @@ def main():
         sys.exit(1)
 
     print(json.dumps(result, indent=2))
+
+    # Rebuild index after write ops so subsequent
+    # searches find newly created entities
+    if tool_name in _WRITE_TOOLS:
+        try:
+            import maintenance
+            maintenance.rebuild_index(memory_dir)
+        except Exception as exc:
+            print(
+                f"Warning: index rebuild failed: {exc}",
+                file=sys.stderr,
+            )
+
+    # Flush recall counts (no-op if nothing changed)
+    try:
+        flush_recall_counts()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

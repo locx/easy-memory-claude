@@ -531,3 +531,4 @@ def rewrite_graph(memory_dir, entities_dict, relations):
             except OSError:
                 pass
             raise
+        invalidate_caches()

@@ -290,7 +290,8 @@
             "revised",
             "adopted",
             "rejected",
-            "deferred"
+            "deferred",
+            "obsolete"
           ],
           "description": "Current outcome status (default: pending)",
           "default": "pending"
@@ -327,7 +328,8 @@
             "revised",
             "adopted",
             "rejected",
-            "deferred"
+            "deferred",
+            "obsolete"
           ],
           "description": "How it turned out"
         },
@@ -344,23 +346,20 @@
   },
   {
     "name": "list_decisions",
-    "description": "List all recorded decisions with their status, sorted by most recent first.",
+    "description": "List all recorded decisions with their status. Without stale_days: sorted newest first. With stale_days: returns only pending decisions older than N days, sorted oldest first (stale hygiene).",
     "inputSchema": {
       "type": "object",
-      "properties": {}
+      "properties": {
+        "stale_days": {
+          "type": "number",
+          "description": "If set, return only pending decisions older than this many days (oldest first)"
+        }
+      }
     }
   },
   {
     "name": "graph_stats",
     "description": "Return graph health statistics: entity/relation counts, type breakdown, branch distribution, index age, recall rankings, pending decisions, and current session activity counters.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {}
-    }
-  },
-  {
-    "name": "rebuild_index",
-    "description": "Force rebuild the TF-IDF search index. Normally built automatically by the SessionStart maintenance hook once per day.",
     "inputSchema": {
       "type": "object",
       "properties": {}
