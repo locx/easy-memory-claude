@@ -1,0 +1,54 @@
+#!/bin/bash
+# mem — short wrapper for easy-memory-claude CLI.
+# Resolves MEMORY_DIR from git root or upwards automatically.
+# Usage:
+#   mem search auth
+#   mem search auth --top-k 5 --compact
+#   mem write '{"entities":[...]}'
+#   mem recall auth
+#   mem status
+#   mem decide '{"title":"...","rationale":"..."}'
+#   mem remove '{"entity_names":["..."]}'
+#   mem doctor
+#   mem rebuild
+#   mem <legacy_tool_name> '<json>'
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+find_root() {
+    local d="$PWD"
+    
+    # 1. Look for existing .memory upwards
+    while [ "$d" != "/" ] && [ -n "$d" ]; do
+        if [ -d "$d/.memory" ]; then
+            echo "$d"
+            return
+        fi
+        d="$(dirname "$d")"
+    done
+
+    # 2. Look for git root
+    if git rev-parse --show-toplevel 2>/dev/null; then
+        return
+    fi
+    
+    # 3. Look for common project markers upwards
+    d="$PWD"
+    while [ "$d" != "/" ] && [ -n "$d" ]; do
+        if [ -f "$d/package.json" ] || [ -f "$d/pyproject.toml" ] || [ -f "$d/requirements.txt" ] || [ -f "$d/pom.xml" ]; then
+            echo "$d"
+            return
+        fi
+        d="$(dirname "$d")"
+    done
+    
+    # 4. Fallback to current directory
+    echo "$PWD"
+}
+
+PROJECT_ROOT="$(find_root)"
+export MEMORY_DIR="${MEMORY_DIR:-${PROJECT_ROOT}/.memory}"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
+
+exec python3 "${SCRIPT_DIR}/memory-cli.py" "$@"

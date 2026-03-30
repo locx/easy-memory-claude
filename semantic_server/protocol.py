@@ -33,6 +33,77 @@ with _res.files(__package__).joinpath(
     TOOLS = json.load(_f)
 
 
+def _dispatch_tool_call(tool_name, args, memory_dir):
+    if tool_name == "semantic_search_memory":
+        return search(
+            args.get("query", ""),
+            memory_dir,
+            args.get("top_k", 5),
+            branch=args.get("branch"),
+        )
+    if tool_name == "traverse_relations":
+        return traverse_relations(
+            args.get("entity", ""),
+            memory_dir,
+            args.get("direction", "both"),
+            args.get("max_depth", 2),
+        )
+    if tool_name == "search_memory_by_time":
+        return search_by_time(
+            memory_dir,
+            args.get("since"),
+            args.get("until"),
+            args.get("limit", 20),
+            branch_filter=args.get("branch_filter"),
+            entity_type=args.get("entity_type"),
+        )
+    if tool_name == "create_entities":
+        return create_entities(
+            args.get("entities", []),
+            memory_dir,
+        )
+    if tool_name == "create_relations":
+        return create_relations(
+            args.get("relations", []),
+            memory_dir,
+        )
+    if tool_name == "add_observations":
+        return add_observations(
+            args.get("entity", ""),
+            args.get("observations", []),
+            memory_dir,
+        )
+    if tool_name == "delete_entities":
+        return delete_entities(
+            args.get("entity_names", []),
+            memory_dir,
+        )
+    if tool_name == "create_decision":
+        return create_decision(args, memory_dir)
+    if tool_name == "update_decision_outcome":
+        return update_decision_outcome(args, memory_dir)
+    if tool_name == "list_decisions":
+        return list_decisions(
+            memory_dir,
+            stale_days=args.get("stale_days"),
+        )
+    if tool_name == "remove_observations":
+        return remove_observations(
+            args.get("entity", ""),
+            args.get("observations", []),
+            memory_dir,
+        )
+    if tool_name == "rename_entity":
+        return rename_entity(
+            args.get("old_name", ""),
+            args.get("new_name", ""),
+            memory_dir,
+        )
+    if tool_name == "graph_stats":
+        return graph_stats(memory_dir)
+    return None
+
+
 def handle_message(msg, memory_dir):
     """Handle a single JSON-RPC 2.0 message."""
     if not isinstance(msg, dict):
@@ -77,90 +148,14 @@ def handle_message(msg, memory_dir):
             args = {}
 
         try:
-            if tool_name == "semantic_search_memory":
-                result = search(
-                    args.get("query", ""),
-                    memory_dir,
-                    args.get("top_k", 5),
-                    branch=args.get("branch"),
-                )
-            elif tool_name == "traverse_relations":
-                result = traverse_relations(
-                    args.get("entity", ""),
-                    memory_dir,
-                    args.get("direction", "both"),
-                    args.get("max_depth", 2),
-                )
-            elif tool_name == "search_memory_by_time":
-                result = search_by_time(
-                    memory_dir,
-                    args.get("since"),
-                    args.get("until"),
-                    args.get("limit", 20),
-                    branch_filter=args.get(
-                        "branch_filter"
-                    ),
-                    entity_type=args.get(
-                        "entity_type"
-                    ),
-                )
-            elif tool_name == "create_entities":
-                result = create_entities(
-                    args.get("entities", []),
-                    memory_dir,
-                )
-            elif tool_name == "create_relations":
-                result = create_relations(
-                    args.get("relations", []),
-                    memory_dir,
-                )
-            elif tool_name == "add_observations":
-                result = add_observations(
-                    args.get("entity", ""),
-                    args.get("observations", []),
-                    memory_dir,
-                )
-            elif tool_name == "delete_entities":
-                result = delete_entities(
-                    args.get("entity_names", []),
-                    memory_dir,
-                )
-            elif tool_name == "create_decision":
-                result = create_decision(
-                    args, memory_dir,
-                )
-            elif tool_name == "update_decision_outcome":
-                result = update_decision_outcome(
-                    args, memory_dir,
-                )
-            elif tool_name == "list_decisions":
-                result = list_decisions(
-                    memory_dir,
-                    stale_days=args.get("stale_days"),
-                )
-            elif tool_name == "remove_observations":
-                result = remove_observations(
-                    args.get("entity", ""),
-                    args.get("observations", []),
-                    memory_dir,
-                )
-            elif tool_name == "rename_entity":
-                result = rename_entity(
-                    args.get("old_name", ""),
-                    args.get("new_name", ""),
-                    memory_dir,
-                )
-            elif tool_name == "graph_stats":
-                result = graph_stats(memory_dir)
-            else:
+            result = _dispatch_tool_call(tool_name, args, memory_dir)
+            if result is None:
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "error": {
                         "code": -32601,
-                        "message": (
-                            f"Unknown tool: {tool_name}"
-                        ),
+                        "message": f"Unknown tool: {tool_name}",
                     },
                 }
         except Exception as exc:

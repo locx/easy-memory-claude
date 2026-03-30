@@ -31,6 +31,7 @@ def clear_entity_cache():
         data=None, mtime=0.0, path="", size=0,
         offset=0, append_only=False,
     )
+    entity_cache.pop("_pre_invalidate_mtime", None)
 
 
 def clear_relation_cache():
@@ -59,10 +60,10 @@ def _cache_total():
 
 
 def maybe_evict_caches():
-    """Evict caches in priority order until under cap."""
+    """Evict caches by size (largest first) until under cap."""
     if _cache_total() <= MAX_CACHE_BYTES:
         return
-    for cache, clear_fn in (
+    evictable = [
         (index_cache, clear_index_cache),
         (adjacency_cache,
          lambda: adjacency_cache.update(
@@ -70,7 +71,10 @@ def maybe_evict_caches():
              mtime=0.0, size=0)),
         (entity_cache, clear_entity_cache),
         (relation_cache, clear_relation_cache),
-    ):
+    ]
+    # Sort by size descending — evict largest first
+    evictable.sort(key=lambda x: x[0]["size"], reverse=True)
+    for cache, clear_fn in evictable:
         if cache["size"] > 0:
             clear_fn()
             if _cache_total() <= MAX_CACHE_BYTES:

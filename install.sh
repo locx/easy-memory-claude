@@ -50,7 +50,7 @@ echo ""
 echo "[3/5] Deploying runtime scripts..."
 
 # Verify source files exist
-for src in maintenance.py semantic_server/__init__.py; do
+for src in maintenance.py semantic_server/__init__.py semantic_server/maintenance_utils.py; do
     if [ ! -f "${SCRIPT_DIR}/${src}" ]; then
         echo "  ERROR: ${SCRIPT_DIR}/${src} not found."
         echo "         Run this installer from the easy-memory-claude project directory."
@@ -80,6 +80,11 @@ echo "  [ok] .source-dir → ${MEMORY_DIR}/"
 cp "${SCRIPT_DIR}/memory-cli.py" "${MEMORY_DIR}/memory-cli.py"
 chmod +x "${MEMORY_DIR}/memory-cli.py"
 echo "  [ok] memory-cli.py (CLI bridge) → ${MEMORY_DIR}/"
+
+# Deploy 'mem' CLI wrapper
+cp "${SCRIPT_DIR}/mem" "${MEMORY_DIR}/mem"
+chmod +x "${MEMORY_DIR}/mem"
+echo "  [ok] mem (CLI wrapper) → ${MEMORY_DIR}/"
 
 # Optional: orjson for faster graph I/O
 if python3 -c "import orjson" 2>/dev/null; then
@@ -247,10 +252,14 @@ echo ""
 echo "============================================================"
 echo "  Installation complete!"
 echo ""
-echo "  Runtime:       ~/.claude/memory/ (4 files + semantic_server/)"
+echo "  Runtime:       ~/.claude/memory/ (5 files + semantic_server package)"
 echo "  Hooks:         ~/.claude/hooks/  (4 shell + 2 Python)"
 echo "  Settings:      ~/.claude/settings.json"
 echo "  Dev/source:    ${SCRIPT_DIR}/"
+echo ""
+echo "  To use the 'mem' command globally:"
+echo "    export PATH=\"\$HOME/.claude/memory:\$PATH\""
+echo "    (Add this to your ~/.bashrc or ~/.zshrc)"
 echo ""
 echo "  To set up a project:"
 echo "    ${SCRIPT_DIR}/setup-project.sh /path/to/project"

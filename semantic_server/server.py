@@ -113,10 +113,38 @@ def _merge_pending(memory_dir):
         pass
 
 
-def main():
-    """Run MCP server on stdio with select-based I/O."""
+def _run_periodic_tasks(now_mono, memory_dir, idx_path):
     import semantic_server.cache as _cache_mod
     global _last_pending_check
+
+    if (now_mono - _cache_mod.last_index_check
+            >= INDEX_CHECK_INTERVAL):
+        _cache_mod.last_index_check = now_mono
+        try:
+            idx_mtime = os.path.getmtime(idx_path)
+            if (index_cache["data"] is not None
+                    and index_cache["path"] == idx_path
+                    and index_cache["mtime"] != idx_mtime):
+                load_index(memory_dir)
+        except OSError:
+            pass
+
+    if (now_mono - _last_pending_check
+            >= _PENDING_CHECK_INTERVAL):
+        _merge_pending(memory_dir)
+
+    if _recall_mod.recall_dirty:
+        if (now_mono - _recall_mod.recall_last_flush
+                > RECALL_FLUSH_INTERVAL):
+            flush_recall_counts()
+
+    branch, changed = refresh_branch()
+    if changed:
+        log_event("BRANCH_SWITCH", f"now on {branch}")
+
+
+def main():
+    """Run MCP server on stdio with select-based I/O."""
 
     signal.signal(signal.SIGTERM, _shutdown_handler)
     signal.signal(signal.SIGINT, _shutdown_handler)
@@ -162,42 +190,7 @@ def main():
     try:
         while not _shutdown_requested:
             _now_mono = time.monotonic()
-
-            # --- Periodic tasks ---
-
-            # Cooperative index reload
-            if (_now_mono - _cache_mod.last_index_check
-                    >= INDEX_CHECK_INTERVAL):
-                _cache_mod.last_index_check = _now_mono
-                try:
-                    idx_mtime = os.path.getmtime(idx_path)
-                    if (index_cache["data"] is not None
-                            and index_cache["path"]
-                            == idx_path
-                            and index_cache["mtime"]
-                            != idx_mtime):
-                        load_index(memory_dir)
-                except OSError:
-                    pass
-
-            # Merge hook sidecar
-            if (_now_mono - _last_pending_check
-                    >= _PENDING_CHECK_INTERVAL):
-                _merge_pending(memory_dir)
-
-            # Flush recall counts
-            if _recall_mod.recall_dirty:
-                if (_now_mono - _recall_mod.recall_last_flush
-                        > RECALL_FLUSH_INTERVAL):
-                    flush_recall_counts()
-
-            # Refresh branch
-            branch, changed = refresh_branch()
-            if changed:
-                log_event(
-                    "BRANCH_SWITCH",
-                    f"now on {branch}",
-                )
+            _run_periodic_tasks(_now_mono, memory_dir, idx_path)
 
             # --- Non-blocking stdin (1s timeout for tasks) ---
             try:

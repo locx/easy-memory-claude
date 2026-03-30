@@ -45,6 +45,33 @@ def _get_adjacency(memory_dir):
     return outbound, inbound
 
 
+def _expand_frontier(frontier, direction, outbound, inbound, visited, seen_edges, edges):
+    next_frontier = []
+    capped = False
+    for node in frontier:
+        neighbors = []
+        if direction in ("outbound", "both"):
+            for to, rt in outbound.get(node, []):
+                neighbors.append((node, to, rt))
+        if direction in ("inbound", "both"):
+            for fr, rt in inbound.get(node, []):
+                neighbors.append((fr, node, rt))
+        for fr, to, rt in neighbors:
+            edge_key = (fr, to, rt)
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+            target = to if fr == node else fr
+            edges.append({"from": fr, "to": to, "relationType": rt})
+            if target not in visited:
+                if len(visited) >= _MAX_VISITED:
+                    capped = True
+                    continue
+                visited.add(target)
+                next_frontier.append(target)
+    return next_frontier, capped
+
+
 def traverse_relations(entity, memory_dir,
                        direction="both",
                        max_depth=2):
@@ -90,45 +117,17 @@ def traverse_relations(entity, memory_dir,
     capped = False
 
     for _depth in range(max_depth):
-        next_frontier = []
-        for node in frontier:
-            neighbors = []
-            if direction in ("outbound", "both"):
-                for to, rt in outbound.get(node, []):
-                    neighbors.append((node, to, rt))
-            if direction in ("inbound", "both"):
-                for fr, rt in inbound.get(node, []):
-                    neighbors.append((fr, node, rt))
-            for fr, to, rt in neighbors:
-                edge_key = (fr, to, rt)
-                if edge_key in seen_edges:
-                    continue
-                seen_edges.add(edge_key)
-                target = to if fr == node else fr
-                edges.append({
-                    "from": fr, "to": to,
-                    "relationType": rt,
-                })
-                if target not in visited:
-                    if len(visited) >= _MAX_VISITED:
-                        capped = True
-                        continue
-                    visited.add(target)
-                    next_frontier.append(target)
-        frontier = next_frontier
+        frontier, capped = _expand_frontier(frontier, direction, outbound, inbound, visited, seen_edges, edges)
         if not frontier or capped:
             break
 
     nodes = []
     for name in visited:
         info = entities.get(name, {})
-        obs = info.get("observations", [])
         nodes.append({
             "name": name,
-            "entityType": info.get(
-                "entityType", ""
-            ),
-            "observations": obs[:3],
+            "entityType": info.get("entityType", ""),
+            "observations": info.get("observations", [])[:3],
         })
 
     result = {"nodes": nodes, "edges": edges}

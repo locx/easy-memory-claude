@@ -21,27 +21,37 @@ from datetime import datetime, timedelta, timezone
 from itertools import chain
 from pathlib import Path
 
-# Fast JSON backend — falls back to stdlib json
+# Fast JSON backend
 try:
-    from semantic_server._json import (
-        loads as _loads, dumps as _dumps, dump as _dump,
-    )
+    from semantic_server._json import loads as _loads, dumps as _dumps, dump as _dump
 except ImportError:
-    try:
-        import orjson as _orjson
-        def _loads(s): return _orjson.loads(s)
-        def _dumps(obj, **kw):
-            return _orjson.dumps(obj).decode("utf-8")
-        def _dump(obj, f, **kw):
-            f.write(_orjson.dumps(obj).decode("utf-8"))
-    except ImportError:
-        _loads = json.loads
-        def _dumps(obj, **kw):
-            sep = kw.get("separators", (",", ":"))
-            return json.dumps(obj, separators=sep)
-        def _dump(obj, f, **kw):
-            sep = kw.get("separators", (",", ":"))
-            json.dump(obj, f, separators=sep)
+    import json as _json
+    _loads = _json.loads
+    def _dumps(obj, **kw):
+        sep = kw.get("separators", (",", ":"))
+        return _json.dumps(obj, separators=sep)
+    def _dump(obj, f, **kw):
+        sep = kw.get("separators", (",", ":"))
+        _json.dump(obj, f, separators=sep)
+
+from semantic_server.io_utils import iter_jsonl, partition_graph, write_jsonl
+from semantic_server.stem import stem_word as _stem
+from semantic_server.text import (
+    STOPWORDS as _STOPWORDS,
+    SYNONYM_MAP as _SYNONYM_MAP,
+    normalize_name,
+    make_bigrams as _make_bigrams,
+    filter_token as _filter_token,
+    expand_synonyms as _expand_synonyms,
+    load_aliases,
+)
+from semantic_server.maintenance_utils import (
+    prune_entities,
+    consolidate,
+    stamp_metadata,
+    read_recall_counts,
+    parse_iso_date,
+)
 
 # Configuration defaults (overridable via .memory/config.json)
 _DEFAULTS = {
@@ -61,6 +71,8 @@ def _valid(cfg, key, types, lo, hi):
     if (v is not None and isinstance(v, types)
             and not isinstance(v, bool)
             and lo <= v <= hi):
+        if isinstance(v, float) and not math.isfinite(v):
+            return None
         return v
     return None
 
@@ -95,66 +107,7 @@ def _load_config(memory_dir):
 
 
 # Pre-compiled regexes (Unicode-aware)
-_RE_CAMEL = re.compile(
-    r'([a-z\u00e0-\u00ff])([A-Z\u00c0-\u00df])'
-)
-_RE_SEPS = re.compile(r'[_\-.\s]+')
 _RE_WORDS = re.compile(r'\w+', re.UNICODE)
-
-
-def iter_jsonl(path):
-    """Yield dicts from JSONL file, skip malformed lines."""
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    obj = _loads(line)
-                    if isinstance(obj, dict):
-                        yield obj
-                except (json.JSONDecodeError, ValueError,
-                        OverflowError):
-                    continue
-
-
-def partition_graph(path):
-    """Single-pass JSONL partition into (entities, relations, others)."""
-    entities, relations, others = [], [], []
-    for e in iter_jsonl(path):
-        t = e.get("type")
-        if t == "entity":
-            entities.append(e)
-        elif t == "relation":
-            relations.append(e)
-        else:
-            others.append(e)
-    return entities, relations, others
-
-
-def _safe_jsonl_lines(entries):
-    """Yield JSONL lines, skipping unserializable entries."""
-    for e in entries:
-        try:
-            yield _dumps(e) + "\n"
-        except (TypeError, ValueError, OverflowError):
-            continue
-
-
-def write_jsonl(path, entries):
-    """Atomic write via .new + os.replace. Skips unserializable."""
-    tmp = path + ".new"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(_safe_jsonl_lines(entries))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
 
 
 def get_branch(cwd=None):
@@ -172,370 +125,13 @@ def get_branch(cwd=None):
     return "unknown"
 
 
-def parse_iso_date(s):
-    """Parse ISO 8601 to tz-aware datetime (assumes UTC if bare)."""
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-
-def read_recall_counts(memory_dir):
-    """Load recall frequency counts from sidecar file."""
-    rc_path = os.path.join(memory_dir, "recall_counts.json")
-    try:
-        with open(rc_path, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except (OSError, json.JSONDecodeError, ValueError):
-        pass
-    return {}
-
-
-def score_entity(entity, now_ts, recall_counts=None,
-                 cutoff_str=None):
-    """Score: obs_count * recency * recall_boost.
-
-    Uses string comparison for fast age check; falls back
-    to datetime parsing near the decay threshold.
-    """
-    obs_count = len(entity.get("observations", []))
-    if obs_count == 0:
-        return 0.0
-
-    updated = entity.get("_updated", "")
-    if (not updated
-            or (cutoff_str and updated < cutoff_str)):
-        days = _cfg["MAX_AGE_DAYS"]
-    else:
-        dt = parse_iso_date(updated)
-        if not dt:
-            days = _cfg["MAX_AGE_DAYS"]
-        else:
-            days = max(
-                int((now_ts - dt.timestamp()) / 86400), 0
-            )
-
-    recency = 1.0 / (1.0 + days)
-    score = obs_count * recency
-
-    if recall_counts:
-        rc = recall_counts.get(entity.get("name", ""), 0)
-        if rc > 0:
-            score *= (1.0 + math.log(rc))
-
-    return score
-
-
-def prune_entities(entities, relations, recall_counts=None):
-    """Remove low-score entities with zero inbound relations."""
-    has_inbound = {r.get("to", "") for r in relations}
-    now_ts = time.time()
-    cutoff_dt = (datetime.now(timezone.utc)
-                 - timedelta(days=_cfg["MAX_AGE_DAYS"]))
-    cutoff_str = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    pruned_names = set()
-    kept = []
-    for e in entities:
-        name = e.get("name", "")
-        if not name.strip():
-            pruned_names.add(name)
-            continue
-        score = score_entity(
-            e, now_ts, recall_counts,
-            cutoff_str=cutoff_str,
-        )
-        if (score < _cfg["DECAY_THRESHOLD"]
-                and name not in has_inbound):
-            pruned_names.add(name)
-            continue
-        kept.append(e)
-
-    kept_rels = [
-        r for r in relations
-        if r.get("from") not in pruned_names
-        and r.get("to") not in pruned_names
-    ]
-    return kept, kept_rels, len(pruned_names)
-
-
-def normalize_name(name):
-    """Normalize entity name for fuzzy matching."""
-    name = _RE_CAMEL.sub(r'\1 \2', name)
-    return _RE_SEPS.sub(' ', name.lower().strip())
-
-
-def _safe_obs_dedup(observations):
-    """Deduplicate observations preserving insertion order."""
-    if not observations:
-        return []
-    seen = set()
-    result = []
-    for o in observations:
-        key = (o if isinstance(o, str)
-               else json.dumps(o, sort_keys=True))
-        if key not in seen:
-            seen.add(key)
-            result.append(o)
-    return result
-
-
-try:
-    from semantic_server.config import (
-        MAIN_BRANCHES as _MAIN_BRANCHES,
-    )
-except ImportError:
-    _MAIN_BRANCHES = frozenset({
-        "main", "master", "trunk", "develop",
-    })
-_GUARD_AGE_DAYS = 7
-_MAX_CONSOLIDATE_ENTITIES = 50_000
-
-
-def consolidate(entities, relations):
-    """Merge entities with same type + overlapping names.
-
-    O(n log n) sorted-merge with lookahead window. Short
-    names (< MIN_MERGE_NAME_LEN) merge only on exact match.
-    Skips if entity count exceeds safety cap.
-    """
-    if len(entities) > _MAX_CONSOLIDATE_ENTITIES:
-        import sys as _sys
-        print(
-            f"Maintenance: skipping consolidation "
-            f"({len(entities)} entities > "
-            f"{_MAX_CONSOLIDATE_ENTITIES} cap)",
-            file=_sys.stderr,
-        )
-        return entities, relations, 0
-
-    min_merge = _cfg["MIN_MERGE_NAME_LEN"]
-
-    guard_cutoff = (
-        datetime.now(timezone.utc)
-        - timedelta(days=_GUARD_AGE_DAYS)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    n = len(entities)
-    keyed = []
-    for i, e in enumerate(entities):
-        norm = normalize_name(e.get("name", ""))
-        etype = e.get("entityType", "")
-        keyed.append((etype, norm, i))
-
-    keyed.sort()
-
-    merged_count = 0
-    absorbed = set()
-    renames = {}
-    WINDOW = 20 if n < 5000 else 10
-    _MAX_COMPARISONS = 500_000
-    total_comparisons = 0
-
-    for pos in range(n):
-        etype_i, norm_i, idx_i = keyed[pos]
-        if idx_i in absorbed:
-            continue
-        if not norm_i.strip():
-            continue
-
-        ent_i = entities[idx_i]
-        obs_dict_i = None
-        len_i = len(norm_i)
-
-        if total_comparisons > _MAX_COMPARISONS:
-            break
-        for ahead in range(1, WINDOW + 1):
-            total_comparisons += 1
-            j = pos + ahead
-            if j >= n:
-                break
-            etype_j, norm_j, idx_j = keyed[j]
-            if etype_j != etype_i:
-                break
-            if idx_j in absorbed:
-                continue
-            if not norm_j.strip():
-                continue
-
-            len_j = len(norm_j)
-            # Tightened to 2x to prevent false merges
-            if len_i > 2 * len_j or len_j > 2 * len_i:
-                continue
-
-            shorter = min(len_i, len_j)
-            if shorter < min_merge:
-                if norm_i != norm_j:
-                    continue
-
-            # Word-boundary containment check
-            padded_i = f" {norm_i} "
-            padded_j = f" {norm_j} "
-            if (norm_i == norm_j
-                    or padded_i in padded_j
-                    or padded_j in padded_i):
-                ent_j = entities[idx_j]
-                # Cross-branch guard: block merging
-                # young entities from different features
-                bi = ent_i.get("_branch", "")
-                bj = ent_j.get("_branch", "")
-                if (bi and bj and bi != bj
-                        and bi not in _MAIN_BRANCHES
-                        and bj not in _MAIN_BRANCHES):
-                    ci = ent_i.get("_created", "")
-                    cj = ent_j.get("_created", "")
-                    if (ci and ci > guard_cutoff
-                            and cj
-                            and cj > guard_cutoff):
-                        continue
-                # Lazy dedup — built once per absorber
-                if obs_dict_i is None:
-                    obs_dict_i = _safe_obs_dedup(
-                        ent_i.get("observations", [])
-                    )
-                    _seen_i = {
-                        (o if isinstance(o, str)
-                         else json.dumps(
-                             o, sort_keys=True))
-                        for o in obs_dict_i
-                    }
-                for o in ent_j.get("observations", []):
-                    key = (o if isinstance(o, str)
-                           else json.dumps(
-                               o, sort_keys=True))
-                    if key not in _seen_i:
-                        _seen_i.add(key)
-                        obs_dict_i.append(o)
-                upd_j = ent_j.get("_updated", "")
-                upd_i = ent_i.get("_updated", "")
-                if upd_j and (not upd_i
-                              or upd_j > upd_i):
-                    ent_i["_updated"] = upd_j
-                absorbed.add(idx_j)
-                old_name = ent_j.get("name", "")
-                renames[old_name] = ent_i.get(
-                    "name", ""
-                )
-                merged_count += 1
-
-        if obs_dict_i is not None:
-            ent_i["observations"] = list(obs_dict_i)
-
-    del keyed
-
-    kept = [
-        e for i, e in enumerate(entities)
-        if i not in absorbed
-    ]
-
-    # Cap observations (activity-log: 50, others: 200)
-    MAX_OBS_ACTIVITY = 50
-    MAX_OBS_DEFAULT = 200
-    for e in kept:
-        obs = e.get("observations", [])
-        etype = e.get("entityType", "")
-        cap = (MAX_OBS_ACTIVITY if etype == "activity-log"
-               else MAX_OBS_DEFAULT)
-        if len(obs) > cap:
-            e["observations"] = obs[-cap:]
-
-    # Resolve transitive rename chains (A→B→C → A→C)
-    for k in list(renames):
-        v = renames[k]
-        while v in renames and renames[v] != v:
-            v = renames[v]
-        renames[k] = v
-
-    # Update relation references, drop self-refs + dupes
-    updated_rels = []
-    seen_rels = set()
-    for r in relations:
-        fr = r.get("from", "")
-        to = r.get("to", "")
-        new_fr = renames.get(fr, fr)
-        new_to = renames.get(to, to)
-        if new_fr == new_to:
-            continue
-        rel_key = (
-            new_fr, new_to, r.get("relationType", "")
-        )
-        if rel_key not in seen_rels:
-            seen_rels.add(rel_key)
-            if new_fr != fr or new_to != to:
-                r = dict(
-                    r, **{"from": new_fr, "to": new_to}
-                )
-            updated_rels.append(r)
-
-    return kept, updated_rels, merged_count
-
-
-def stamp_metadata(entities, branch):
-    """Add _branch/_created to new entities; preserve existing _updated."""
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    for e in entities:
-        if "_branch" not in e:
-            e["_branch"] = branch
-        if "_created" not in e:
-            e["_created"] = now
-        if "_updated" not in e:
-            e["_updated"] = now
-    return entities
-
-
-_STOPWORDS = frozenset({
-    "a", "an", "the", "is", "are", "was", "were", "be",
-    "been", "being", "have", "has", "had", "do", "does",
-    "did", "will", "would", "could", "should", "may",
-    "might", "shall", "can", "need", "must", "to", "of",
-    "in", "for", "on", "with", "at", "by", "from", "as",
-    "into", "about", "like", "through", "after", "over",
-    "between", "out", "against", "during", "without",
-    "before", "under", "around", "among", "it", "its",
-    "this", "that", "these", "those", "he", "she", "they",
-    "we", "you", "i", "me", "him", "her", "us", "them",
-    "my", "your", "his", "our", "their", "what", "which",
-    "who", "whom", "how", "when", "where", "why", "all",
-    "each", "every", "both", "few", "more", "most", "other",
-    "some", "such", "no", "nor", "not", "only", "own",
-    "same", "so", "than", "too", "very", "just", "because",
-    "but", "and", "or", "if", "then", "else", "also",
-})
-
-_RE_HEX_NOISE = re.compile(r'^[0-9a-f]{8,}$')
-
-
-def _filter_token(w):
-    """Return True if token should be kept in TF-IDF index."""
-    if len(w) < 2 or len(w) > 50:
-        return False
-    if w in _STOPWORDS:
-        return False
-    if _RE_HEX_NOISE.match(w):
-        return False
-    return True
-
-
-def build_tfidf_index(entities, memory_dir):
-    """Build TF-IDF index with magnitudes, postings, metadata.
-
-    Two-pass: tokenize + DF, then TF-IDF vectors. Filters
-    stopwords and singleton terms (DF < 2 when corpus > 50).
-    """
-    if not entities:
-        return 0
-
-    # Pass 1: tokenize + compute DF + collect metadata
+def _tokenize_docs(entities, alias_map):
     docs = {}
     meta = {}
     df = Counter()
+    def _expand(w):
+        return alias_map.get(w, w)
+
     for ent in entities:
         name = ent.get("name", "")
         obs = ent.get("observations", [])
@@ -546,16 +142,12 @@ def build_tfidf_index(entities, memory_dir):
             else:
                 obs_strs.append(str(o))
         etype = ent.get("entityType", "")
-        # Tokenize each component independently to reduce
-        # GC pressure (~1.2GB less for 10K entities)
         words = []
         for piece in chain((name, etype), obs_strs):
-            words.extend(
-                w for w in _RE_WORDS.findall(
-                    piece.lower()
-                )
-                if _filter_token(w)
-            )
+            raw = [w for w in _RE_WORDS.findall(piece.lower()) if _filter_token(w)]
+            stemmed = [_expand(_stem(w)) for w in raw]
+            words.extend(stemmed)
+            words.extend(_make_bigrams(stemmed))
         if words:
             docs[name] = words
             meta[name] = {
@@ -565,14 +157,44 @@ def build_tfidf_index(entities, memory_dir):
             }
             for w in set(words):
                 df[w] += 1
+    return docs, meta, df
+
+def build_tfidf_index(entities, memory_dir):
+    """Build TF-IDF index with magnitudes, postings, metadata.
+
+    Two-pass: tokenize + DF, then TF-IDF vectors. Filters
+    stopwords and singleton terms (DF < 2 when corpus > 50).
+    Uses stemming, bigrams, and synonym expansion.
+    """
+    if not entities:
+        # Remove stale index so search doesn't return
+        # results for pruned/nonexistent entities
+        _stale = os.path.join(memory_dir, "tfidf_index.json")
+        try:
+            os.unlink(_stale)
+        except OSError:
+            pass
+        return 0
+
+    # Load project-specific aliases for synonym expansion
+    alias_map = load_aliases(memory_dir)
+    docs, meta, df = _tokenize_docs(entities, alias_map)
 
     if not docs:
+        _stale = os.path.join(memory_dir, "tfidf_index.json")
+        try:
+            os.unlink(_stale)
+        except OSError:
+            pass
         return 0
 
     n_docs = len(docs)
     min_df = 2 if n_docs > 50 else 1
+    # BM25-style IDF: boosts rare terms, floor at 0.1
     idf = {
-        w: math.log((n_docs + 1) / (count + 1)) + 1
+        w: max(0.1, math.log(
+            (n_docs - count + 0.5) / (count + 0.5) + 1
+        ))
         for w, count in df.items()
         if count >= min_df
     }
@@ -783,7 +405,6 @@ def _merge_pending_file(memory_dir, graph_path):
     """
     pending = graph_path + ".pending"
     merging = pending + ".merging"
-    processing = pending + ".processing"
 
     # Only recover .merging — .processing is owned by
     # the MCP server process (server.py)
@@ -795,6 +416,53 @@ def _merge_pending_file(memory_dir, graph_path):
     except OSError:
         return
     _do_pending_merge(merging, graph_path)
+
+
+def _backup_graph(graph_path):
+    bak_path = graph_path + ".bak"
+    try:
+        try:
+            os.unlink(bak_path)
+        except OSError:
+            pass
+        os.link(graph_path, bak_path)
+    except OSError:
+        try:
+            shutil.copy2(graph_path, bak_path)
+        except OSError as exc:
+            print(f"Maintenance: backup failed, aborting: {exc}")
+            return False
+    return True
+
+def _compute_maintenance(entities, relations, project_dir, memory_dir):
+    branch = get_branch(cwd=project_dir)
+    recall_counts = read_recall_counts(memory_dir)
+    entities = stamp_metadata(entities, branch)
+    entities, relations, pruned = prune_entities(
+        entities, relations, recall_counts,
+        max_age_days=_cfg["MAX_AGE_DAYS"],
+        decay_threshold=_cfg["DECAY_THRESHOLD"]
+    )
+    entities, relations, merged = consolidate(
+        entities, relations,
+        min_merge_name_len=_cfg["MIN_MERGE_NAME_LEN"]
+    )
+    return entities, relations, pruned, merged, recall_counts
+
+def _finalize_maintenance(memory_dir, entities, recall_counts, pruned, merged):
+    if pruned or merged:
+        log_pruned(memory_dir, pruned, merged)
+        print(f"Maintenance: pruned {pruned}, merged {merged} entities")
+    if recall_counts:
+        live_names = {e.get("name", "") for e in entities}
+        stale = [k for k in recall_counts if k not in live_names]
+        if stale:
+            for k in stale:
+                del recall_counts[k]
+            rc_path = os.path.join(memory_dir, "recall_counts.json")
+            with open(rc_path, "w") as f:
+                json.dump(recall_counts, f)
+    rebuild_index(memory_dir)
 
 
 def run(project_dir):
@@ -809,65 +477,31 @@ def run(project_dir):
     if not os.path.exists(graph_path):
         return
 
-    # Throttle
     if os.path.exists(marker):
-        age_h = (
-            (time.time() - os.path.getmtime(marker)) / 3600
-        )
+        age_h = (time.time() - os.path.getmtime(marker)) / 3600
         if age_h < _cfg["THROTTLE_HOURS"]:
             return
 
-    # --- Read + compute phase (NO lock) ---
-    # Backup: hard link (O(1)) with fallback to copy
-    bak_path = graph_path + ".bak"
-    try:
-        try:
-            os.unlink(bak_path)
-        except OSError:
-            pass
-        os.link(graph_path, bak_path)
-    except OSError:
-        try:
-            shutil.copy2(graph_path, bak_path)
-        except OSError as exc:
-            print(
-                f"Maintenance: backup failed: {exc}"
-            )
+    if not _backup_graph(graph_path):
+        return
 
     try:
-        entities, relations, others = partition_graph(
-            graph_path
-        )
+        entities, relations, others = partition_graph(graph_path)
     except (OSError, MemoryError) as exc:
-        print(f"Maintenance: failed to load graph: "
-              f"{exc}")
+        print(f"Maintenance: failed to load graph: {exc}")
         return
     if not entities and not relations and not others:
         Path(marker).touch()
         return
 
-    # Record mtime before compute — detect races
     try:
         pre_mtime = os.path.getmtime(graph_path)
     except OSError:
         pre_mtime = 0.0
 
-    branch = get_branch(cwd=project_dir)
-    recall_counts = read_recall_counts(memory_dir)
+    entities, relations, pruned, merged, recall_counts = \
+        _compute_maintenance(entities, relations, project_dir, memory_dir)
 
-    t0 = time.monotonic()
-    entities = stamp_metadata(entities, branch)
-    t1 = time.monotonic()
-    entities, relations, pruned = prune_entities(
-        entities, relations, recall_counts
-    )
-    t2 = time.monotonic()
-    entities, relations, merged = consolidate(
-        entities, relations
-    )
-    t3 = time.monotonic()
-
-    # --- Write phase (LOCKED) ---
     lock_fd = _acquire_lock(memory_dir)
     if lock_fd is None:
         print("Maintenance: skipped (another instance running)")
@@ -879,95 +513,17 @@ def run(project_dir):
         except OSError:
             post_mtime = 0.0
         if post_mtime != pre_mtime:
-            print("Maintenance: graph modified during "
-                  "compute — skipping write (will retry)")
+            print("Maintenance: graph modified during compute — skipping")
             return
 
-        # chain() avoids allocating a merged list
-        write_jsonl(
-            graph_path,
-            chain(entities, relations, others),
-        )
+        write_jsonl(graph_path, chain(entities, relations, others))
         Path(marker).touch()
     finally:
         _release_lock(lock_fd)
 
-    del others
-
-    if pruned or merged:
-        log_pruned(memory_dir, pruned, merged)
-        print(
-            f"Maintenance: pruned {pruned}, "
-            f"merged {merged} entities"
-        )
-
-    # Prune stale recall counts (no lock needed)
-    if recall_counts:
-        live_names = {
-            e.get("name", "") for e in entities
-        }
-        stale = [
-            k for k in recall_counts
-            if k not in live_names
-        ]
-        if stale:
-            for k in stale:
-                del recall_counts[k]
-            rc_path = os.path.join(
-                memory_dir, "recall_counts.json"
-            )
-            rc_tmp = rc_path + ".new"
-            try:
-                with open(rc_tmp, "w",
-                          encoding="utf-8") as f:
-                    json.dump(recall_counts, f,
-                              separators=(",", ":"))
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(rc_tmp, rc_path)
-            except Exception:
-                try:
-                    os.unlink(rc_tmp)
-                except OSError:
-                    pass
-
-    n_relations = len(relations)
-    del recall_counts, relations
-
-    # Stats before index (frees entities sooner)
-    _print_graph_stats(
-        entities, n_relations, pruned, merged, memory_dir
+    _finalize_maintenance(
+        memory_dir, entities, recall_counts, pruned, merged
     )
-
-    # Lightweight copy for index build
-    index_input = [
-        {"name": e.get("name", ""),
-         "entityType": e.get("entityType", ""),
-         "observations": e.get("observations", []),
-         "_branch": e.get("_branch", "")}
-        for e in entities
-    ]
-    del entities
-
-    try:
-        indexed = build_tfidf_index(
-            index_input, memory_dir
-        )
-        t4 = time.monotonic()
-        if indexed:
-            print(
-                f"TF-IDF index: {indexed} entities indexed"
-            )
-        print(
-            f"  timing: stamp={t1 - t0:.3f}s "
-            f"prune={t2 - t1:.3f}s "
-            f"consolidate={t3 - t2:.3f}s "
-            f"index={t4 - t3:.3f}s"
-        )
-    except Exception as e:
-        print(f"Warning: TF-IDF index build failed: {e}")
-
-    del index_input
 
 
 def rebuild_index(memory_dir):
@@ -996,9 +552,11 @@ def rebuild_index(memory_dir):
 
 
 if __name__ == "__main__":
+    _dry_run = "--dry-run" in sys.argv
+    _args = [a for a in sys.argv[1:] if a != "--dry-run"]
     proj = (
-        sys.argv[1]
-        if len(sys.argv) > 1
+        _args[0]
+        if _args
         else os.environ.get(
             "CLAUDE_PROJECT_DIR", os.getcwd()
         )
@@ -1008,5 +566,25 @@ if __name__ == "__main__":
         print(
             f"Maintenance: skipped — no .memory/ in {proj}"
         )
+    elif _dry_run:
+        _load_config(mem_dir)
+        gp = os.path.join(mem_dir, "graph.jsonl")
+        if os.path.exists(gp):
+            ents, rels, _ = partition_graph(gp)
+            rc = read_recall_counts(mem_dir)
+            _, _, pruned = prune_entities(
+                list(ents), list(rels), rc,
+                max_age_days=_cfg["MAX_AGE_DAYS"],
+                decay_threshold=_cfg["DECAY_THRESHOLD"]
+            )
+            _, _, merged = consolidate(
+                list(ents), list(rels),
+                min_merge_name_len=_cfg["MIN_MERGE_NAME_LEN"]
+            )
+            print(
+                f"Dry-run: would prune {pruned}, "
+                f"merge {merged} of {len(ents)} "
+                f"entities, {len(rels)} relations"
+            )
     else:
         run(proj)

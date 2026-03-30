@@ -1,13 +1,13 @@
 [
   {
     "name": "semantic_search_memory",
-    "description": "Search the memory knowledge graph using TF-IDF semantic similarity. Returns entities ranked by relevance to the query, with their type and top observations.",
+    "description": "Search the knowledge graph by topic. Returns ranked entities with scores. Use for: finding context on a topic, checking if something was already recorded, looking up decisions. Add --compact for token-efficient name+score results.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "query": {
           "type": "string",
-          "description": "Natural language search query"
+          "description": "Natural language search query (synonyms and aliases are expanded automatically)"
         },
         "top_k": {
           "type": "integer",
@@ -16,7 +16,12 @@
         },
         "branch": {
           "type": "string",
-          "description": "Branch to boost results for (default: auto-detected)"
+          "description": "Branch to boost results for (default: auto-detected from git)"
+        },
+        "compact": {
+          "type": "boolean",
+          "description": "If true, return entity names + scores only (saves tokens). Default false.",
+          "default": false
         }
       },
       "required": [
@@ -26,13 +31,13 @@
   },
   {
     "name": "traverse_relations",
-    "description": "Traverse the memory knowledge graph from a start entity, following relations up to max_depth hops. Returns connected subgraph with nodes and edges.",
+    "description": "Follow relationships from an entity through the graph via BFS. Returns connected subgraph (nodes + edges). Use for: understanding dependencies, seeing what connects to what, exploring architecture. Use search first to find the entity name, then traverse.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "entity": {
           "type": "string",
-          "description": "Start entity name"
+          "description": "Exact entity name to start from (use search to find names first)"
         },
         "direction": {
           "type": "string",
@@ -57,7 +62,7 @@
   },
   {
     "name": "search_memory_by_time",
-    "description": "Search memory entities by time range. Returns entities updated/created within the window, sorted by most recent first. Optionally filter by entity type.",
+    "description": "Find entities by time range. Returns entities updated/created within the window, newest first. Use for: 'what changed recently?', 'what decisions were made last week?'.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -80,14 +85,14 @@
         },
         "entity_type": {
           "type": "string",
-          "description": "Filter to entities of this type (e.g. Decision, Module, Pattern)"
+          "description": "Filter to entities of this type (e.g. decision, component, file-warning, service)"
         }
       }
     }
   },
   {
     "name": "create_entities",
-    "description": "Create or merge entities in the knowledge graph. If an entity with the same name exists, observations are merged and _updated refreshed.",
+    "description": "Create or merge entities. If an entity with the same name exists, new observations are appended (deduped) and _updated is refreshed. Use for: recording new components/services/patterns, adding file-warnings for fragile code.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -99,18 +104,18 @@
             "properties": {
               "name": {
                 "type": "string",
-                "description": "Entity name"
+                "description": "Entity name (unique identifier)"
               },
               "entityType": {
                 "type": "string",
-                "description": "Type (Module, Component, Pattern, Architecture, etc.)"
+                "description": "Type: component, service, module, function, file, decision, file-warning, bug, or custom"
               },
               "observations": {
                 "type": "array",
                 "items": {
                   "type": "string"
                 },
-                "description": "Facts about the entity"
+                "description": "Facts about the entity. Each observation is a plain string."
               }
             },
             "required": [
@@ -128,7 +133,7 @@
   },
   {
     "name": "create_relations",
-    "description": "Create directed relations between entities. Duplicates are silently skipped.",
+    "description": "Create directed edges between entities. Duplicates are silently skipped. Referenced entities that don't exist are auto-created as stubs. Use for: recording dependencies, call chains, ownership.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -148,7 +153,7 @@
               },
               "relationType": {
                 "type": "string",
-                "description": "Relation type (uses, contains, imports, etc.)"
+                "description": "Relation type: uses, depends-on, extends, calls, owns, contains, decided-for, or custom"
               }
             },
             "required": [
@@ -166,13 +171,13 @@
   },
   {
     "name": "add_observations",
-    "description": "Add new observations to an existing entity. Duplicate observations are skipped.",
+    "description": "Append new facts to an existing entity. Duplicate observations are skipped. Entity must already exist (use create_entities otherwise). Warns on potential contradictions.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "entity": {
           "type": "string",
-          "description": "Entity name"
+          "description": "Entity name (must exist)"
         },
         "observations": {
           "type": "array",
@@ -190,7 +195,7 @@
   },
   {
     "name": "remove_observations",
-    "description": "Remove specific observations from an existing entity. Non-matching observations are silently ignored.",
+    "description": "Remove specific observations from an entity. Non-matching observations are silently ignored.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -203,7 +208,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Observations to remove (exact match)"
+          "description": "Observations to remove (exact string match)"
         }
       },
       "required": [
@@ -214,7 +219,7 @@
   },
   {
     "name": "delete_entities",
-    "description": "Delete entities by name. Relations involving deleted entities are cascade-removed.",
+    "description": "Delete entities by name. Relations referencing deleted entities are cascade-removed.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -254,13 +259,13 @@
   },
   {
     "name": "create_decision",
-    "description": "Record an architectural or design decision with structured rationale, rejected alternatives, and outcome tracking. Use this when the session involved choosing between approaches, evaluating trade-offs, or making scoping decisions.",
+    "description": "Record an architectural/design decision with structured rationale and alternatives. Creates a 'decision: <title>' entity with decided-for relations to affected entities. Use whenever a task involved choosing between approaches.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "title": {
           "type": "string",
-          "description": "What was decided"
+          "description": "What was decided (e.g. 'Use PostgreSQL over MongoDB for user data')"
         },
         "rationale": {
           "type": "string",
@@ -275,11 +280,11 @@
           "items": {
             "type": "string"
           },
-          "description": "Rejected alternatives with reasons (e.g. 'Vector clocks -- too complex for single-writer model')"
+          "description": "Rejected alternatives with reasons (e.g. 'MongoDB -- no multi-doc txns')"
         },
         "scope": {
           "type": "string",
-          "description": "What code/area this affects"
+          "description": "What code/area this decision affects"
         },
         "outcome": {
           "type": "string",
@@ -301,7 +306,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Entity names to link this decision to via relations"
+          "description": "Entity names this decision affects (creates decided-for relations)"
         }
       },
       "required": [
@@ -312,7 +317,7 @@
   },
   {
     "name": "update_decision_outcome",
-    "description": "Update a decision's outcome and optionally record a lesson learned. Use when returning to work affected by a prior decision to close the learning loop.",
+    "description": "Resolve a decision: set its outcome and record what was learned. Use when returning to work affected by a prior decision, or when SessionStart shows stale pending decisions.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -335,7 +340,7 @@
         },
         "lesson": {
           "type": "string",
-          "description": "What was learned from this decision"
+          "description": "What was learned (recorded as observation)"
         }
       },
       "required": [
@@ -346,20 +351,20 @@
   },
   {
     "name": "list_decisions",
-    "description": "List all recorded decisions with their status. Without stale_days: sorted newest first. With stale_days: returns only pending decisions older than N days, sorted oldest first (stale hygiene).",
+    "description": "List all decisions with their outcome status. Without stale_days: newest first. With stale_days: only pending decisions older than N days, oldest first.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "stale_days": {
           "type": "number",
-          "description": "If set, return only pending decisions older than this many days (oldest first)"
+          "description": "If set, return only pending decisions older than this many days"
         }
       }
     }
   },
   {
     "name": "graph_stats",
-    "description": "Return graph health statistics: entity/relation counts, type breakdown, branch distribution, index age, recall rankings, pending decisions, and current session activity counters.",
+    "description": "Graph health: entity/relation counts, type breakdown, branch distribution, index age, top recalled entities, pending decisions, session activity. Use for diagnostics, not routine checks (SessionStart hook already shows status).",
     "inputSchema": {
       "type": "object",
       "properties": {}

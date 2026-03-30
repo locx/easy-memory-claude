@@ -79,17 +79,94 @@ def get_graph_mtime(memory_dir):
         return graph_path, None
 
 
-def _parse_graph_file(graph_path, start_offset=0):
-    """Parse graph.jsonl into (entities_dict, relations_list).
+_MAX_RAW_LINE_BYTES = MAX_INPUT_CHARS * 4
 
-    Merges duplicate entity names. Supports start_offset
-    for incremental reads. Returns (entities, relations, end_offset).
-    """
+
+def _iter_graph_lines(f, start_offset, max_incr_bytes, deadline):
+    line_count = 0
+    for raw in f:
+        end_offset = f.tell()
+        if (end_offset - start_offset > max_incr_bytes):
+            sys.stderr.write("warn: incremental read byte budget exceeded\n")
+            break
+        if len(raw) > _MAX_RAW_LINE_BYTES:
+            continue
+        line = raw.decode("utf-8", errors="replace")
+        if "\ufffd" in line:
+            continue
+        line = line.strip()
+        if not line:
+            continue
+        line_count += 1
+        if line_count % 1000 == 0 and time.monotonic() > deadline:
+            sys.stderr.write(f"warn: parse time budget exceeded after {line_count} lines\n")
+            break
+        yield line, end_offset
+
+
+def _handle_entity_entry(entities, obj):
+    name = obj.get("name", "")
+    if isinstance(name, str):
+        name = name.strip()
+    if not name:
+        return
+    if name not in entities and len(entities) >= MAX_ENTITY_COUNT:
+        return
+    obs = obj.get("observations", [])
+    if not isinstance(obs, list):
+        obs = []
+    if name in entities:
+        prev = entities[name]
+        prev["_obs_keys"] = _merge_obs(
+            prev.get("observations", []),
+            obs,
+            prev.get("_obs_keys"),
+        )
+        _merge_ts(
+            prev,
+            _norm_ts(obj.get("_created", "")),
+            _norm_ts(obj.get("_updated", "")),
+        )
+        branch = obj.get("_branch")
+        if branch and not prev.get("_branch"):
+            prev["_branch"] = branch
+    else:
+        obs_list = list(obs)
+        if len(obs_list) > MAX_CACHED_OBS:
+            obs_list = obs_list[-MAX_CACHED_OBS:]
+        info = {
+            "entityType": obj.get("entityType", ""),
+            "observations": obs_list,
+            "_created": _norm_ts(obj.get("_created", "")),
+            "_updated": _norm_ts(obj.get("_updated", "")),
+        }
+        branch = obj.get("_branch")
+        if branch:
+            info["_branch"] = branch
+        entities[name] = info
+
+
+def _handle_relation_entry(relations, rel_seen, obj):
+    r_from = obj.get("from", "")
+    r_to = obj.get("to", "")
+    if not r_from or not r_to:
+        return
+    r_type = obj.get("relationType", "")
+    rel_key = (r_from, r_to, r_type)
+    if rel_key not in rel_seen:
+        rel_seen.add(rel_key)
+        relations.append({
+            "from": r_from,
+            "to": r_to,
+            "relationType": r_type,
+        })
+
+def _parse_graph_file(graph_path, start_offset=0):
+    """Parse graph.jsonl into (entities_dict, relations_list)."""
     entities = {}
     relations = []
-    _rel_seen = set()
+    rel_seen = set()
     deadline = time.monotonic() + PARSE_TIME_BUDGET
-    line_count = 0
     end_offset = start_offset
     max_incr_bytes = MAX_GRAPH_BYTES if start_offset == 0 \
         else min(MAX_GRAPH_BYTES, 10_000_000)
@@ -97,111 +174,17 @@ def _parse_graph_file(graph_path, start_offset=0):
         with open(graph_path, "rb") as f:
             if start_offset > 0:
                 f.seek(start_offset)
-            for raw in f:
-                end_offset = f.tell()
-                if (end_offset - start_offset
-                        > max_incr_bytes):
-                    sys.stderr.write(
-                        "warn: incremental read byte "
-                        "budget exceeded\n"
-                    )
-                    break
-                line = raw.decode("utf-8", errors="replace")
-                if len(line) > MAX_INPUT_CHARS:
-                    continue
-                line = line.strip()
-                if not line:
-                    continue
-                line_count += 1
-                if line_count % 1000 == 0:
-                    if time.monotonic() > deadline:
-                        sys.stderr.write(
-                            "warn: parse time budget "
-                            f"exceeded after {line_count}"
-                            " lines\n"
-                        )
-                        break
+            for line, offset in _iter_graph_lines(f, start_offset, max_incr_bytes, deadline):
+                end_offset = offset
                 try:
                     obj = _fast_loads(line)
                     if not isinstance(obj, dict):
                         continue
                     t = obj.get("type")
                     if t == "entity":
-                        name = obj.get("name", "")
-                        if isinstance(name, str):
-                            name = name.strip()
-                        if not name:
-                            continue
-                        if (name not in entities
-                                and len(entities)
-                                >= MAX_ENTITY_COUNT):
-                            continue
-                        obs = obj.get("observations", [])
-                        if not isinstance(obs, list):
-                            obs = []
-                        if name in entities:
-                            prev = entities[name]
-                            prev["_obs_keys"] = _merge_obs(
-                                prev.get(
-                                    "observations", []
-                                ),
-                                obs,
-                                prev.get("_obs_keys"),
-                            )
-                            _merge_ts(
-                                prev,
-                                _norm_ts(
-                                    obj.get("_created", "")
-                                ),
-                                _norm_ts(
-                                    obj.get("_updated", "")
-                                ),
-                            )
-                            # First-writer-wins for branch
-                            branch = obj.get("_branch")
-                            if branch \
-                                    and not prev.get(
-                                        "_branch"
-                                    ):
-                                prev["_branch"] = branch
-                        else:
-                            obs_list = list(obs)
-                            if len(obs_list) > MAX_CACHED_OBS:
-                                obs_list = obs_list[
-                                    -MAX_CACHED_OBS:
-                                ]
-                            info = {
-                                "entityType": obj.get(
-                                    "entityType", ""
-                                ),
-                                "observations": obs_list,
-                                "_created": _norm_ts(
-                                    obj.get("_created", "")
-                                ),
-                                "_updated": _norm_ts(
-                                    obj.get("_updated", "")
-                                ),
-                            }
-                            branch = obj.get("_branch")
-                            if branch:
-                                info["_branch"] = branch
-                            entities[name] = info
+                        _handle_entity_entry(entities, obj)
                     elif t == "relation":
-                        r_from = obj.get("from", "")
-                        r_to = obj.get("to", "")
-                        if not r_from or not r_to:
-                            continue
-                        r_type = obj.get(
-                            "relationType", ""
-                        )
-                        rel_key = (r_from, r_to, r_type)
-                        if rel_key not in _rel_seen:
-                            _rel_seen.add(rel_key)
-                            relations.append({
-                                "from": r_from,
-                                "to": r_to,
-                                "relationType": r_type,
-                            })
+                        _handle_relation_entry(relations, rel_seen, obj)
                 except (json.JSONDecodeError, ValueError):
                     continue
     except OSError:
@@ -209,6 +192,7 @@ def _parse_graph_file(graph_path, start_offset=0):
     for info in entities.values():
         info.pop("_obs_keys", None)
     return entities, relations, end_offset
+
 
 
 def _do_full_parse(graph_path, mtime):
@@ -225,6 +209,7 @@ def _do_full_parse(graph_path, mtime):
     entity_cache["size"] = estimate_size(entities)
     entity_cache["offset"] = offset
     entity_cache["append_only"] = False
+    entity_cache.pop("_pre_invalidate_mtime", None)
     relation_cache["data"] = relations
     relation_cache["mtime"] = mtime
     relation_cache["path"] = graph_path
@@ -264,6 +249,29 @@ def load_index(memory_dir):
         return None
 
 
+def _merge_incremental_data(existing_ents, new_ents, new_rels):
+    for name, info in new_ents.items():
+        if name in existing_ents:
+            prev = existing_ents[name]
+            _merge_obs(prev["observations"], info.get("observations", []))
+            _merge_ts(prev, info.get("_created", ""), info.get("_updated", ""))
+        else:
+            existing_ents[name] = info
+
+    if relation_cache["data"] is not None and new_rels:
+        existing_keys = {
+            (r["from"], r["to"], r.get("relationType", ""))
+            for r in relation_cache["data"]
+        }
+        added = [
+            r for r in new_rels
+            if (r["from"], r["to"], r.get("relationType", "")) not in existing_keys
+        ]
+        if added:
+            relation_cache["data"].extend(added)
+            relation_cache["size"] += estimate_size(added)
+
+
 def load_graph_entities(memory_dir):
     """Load entities with mtime cache + incremental reads."""
     graph_path, mtime = get_graph_mtime(memory_dir)
@@ -283,60 +291,33 @@ def load_graph_entities(memory_dir):
             and entity_cache["data"] is not None
             and entity_cache["path"] == graph_path
             and prev_offset > 0):
-        new_ents, new_rels, offset = _parse_graph_file(
-            graph_path, start_offset=prev_offset
-        )
-        if new_ents is None:
+        # Guard: verify mtime actually advanced (file was written)
+        # If mtime hasn't changed, hook/concurrent write may not
+        # have flushed yet — fall through to full re-parse.
+        # Use mtime already fetched at top of function (no 2nd stat).
+        if mtime == entity_cache.get("_pre_invalidate_mtime", 0.0):
+            # mtime unchanged since invalidation — force full parse
             entity_cache["append_only"] = False
         else:
-            existing = entity_cache["data"]
-            for name, info in new_ents.items():
-                if name in existing:
-                    prev = existing[name]
-                    _merge_obs(
-                        prev["observations"],
-                        info.get("observations", []),
-                    )
-                    _merge_ts(
-                        prev,
-                        info.get("_created", ""),
-                        info.get("_updated", ""),
-                    )
-                else:
-                    existing[name] = info
-            if relation_cache["data"] is not None \
-                    and new_rels:
-                existing_keys = {
-                    (r["from"], r["to"],
-                     r.get("relationType", ""))
-                    for r in relation_cache["data"]
-                }
-                added = [
-                    r for r in new_rels
-                    if (r["from"], r["to"],
-                        r.get("relationType", ""))
-                    not in existing_keys
-                ]
-                if added:
-                    relation_cache["data"].extend(added)
-                    relation_cache["size"] += (
-                        estimate_size(added)
-                    )
-            entity_cache["mtime"] = mtime
-            entity_cache["offset"] = offset
-            entity_cache["size"] += (
-                estimate_size(new_ents)
-                if new_ents else 0
+            new_ents, new_rels, offset = _parse_graph_file(
+                graph_path, start_offset=prev_offset
             )
-            entity_cache["append_only"] = False
-            if relation_cache["data"] is not None:
-                relation_cache["mtime"] = mtime
-            adjacency_cache.update(
-                outbound=None, inbound=None,
-                mtime=0.0,
-            )
-            maybe_evict_caches()
-            return existing
+            if new_ents is None:
+                entity_cache["append_only"] = False
+                entity_cache.pop("_pre_invalidate_mtime", None)
+            else:
+                existing = entity_cache["data"]
+                _merge_incremental_data(existing, new_ents, new_rels)
+                entity_cache["mtime"] = mtime
+                entity_cache["offset"] = offset
+                entity_cache["size"] += (estimate_size(new_ents) if new_ents else 0)
+                entity_cache["append_only"] = False
+                entity_cache.pop("_pre_invalidate_mtime", None)
+                if relation_cache["data"] is not None:
+                    relation_cache["mtime"] = mtime
+                adjacency_cache.update(outbound=None, inbound=None, mtime=0.0)
+                maybe_evict_caches()
+                return existing
 
     entities, _ = _do_full_parse(graph_path, mtime)
     return entities
@@ -430,6 +411,9 @@ def invalidate_caches():
 def invalidate_entity_cache_only():
     """Mark entity cache for incremental reload."""
     if entity_cache["data"] is not None:
+        # Record mtime before invalidation for coherence guard
+        entity_cache["_pre_invalidate_mtime"] = \
+            entity_cache.get("mtime", 0.0)
         entity_cache["append_only"] = True
         entity_cache["mtime"] = 0.0
     else:

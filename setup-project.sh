@@ -309,28 +309,64 @@ MEMORY_MARKER="## Memory Graph"
 MEMORY_SECTION='
 ## Memory Graph
 
-Knowledge graph at `.memory/`. CLI prefix (inline every call — state does not persist):
+Persistent knowledge graph at `.memory/`. All commands use `mem`:
 
-    MEMORY_DIR=$(git rev-parse --show-toplevel)/.memory PYTHONPATH=~/.claude/memory python3 ~/.claude/memory/memory-cli.py
+    mem <command> [args]
 
-Agents: Discover commands: `<prefix> --help`. Always include this prefix verbatim in agent prompts. `git rev-parse --show-toplevel` resolves the repo root dynamically — safe from any subdirectory or worktree. Never use `$PWD`.
+### Reading Memory
 
-**Fire autonomously — no permission needed, do announcement:**
+SessionStart automatically prints a compact status line. Use these commands **on demand** when you need details:
 
-| When | Action |
-|------|--------|
-| Unfamiliar code | `semantic_search_memory` |
-| Chose approach A over B | `create_decision` — title, rationale, scope |
-| New module/file | `create_decision` — why this structure |
-| Security fix | `create_decision` — threat + mitigation |
-| Revisited decision | `update_decision_outcome` — lesson |
-| New observations on entity | `add_observations` — incremental update |
-| Fragile/surprising code | `create_entities` (file-warning) — risk |
-| Related entities | `create_relations` — link them |
+| Command | When to use | What it returns |
+|---------|-------------|-----------------|
+| `mem search <query>` | Need context on a topic | Ranked entities with observations |
+| `mem recall <query>` | Need context + relationships | Search results + 1-hop graph neighbors |
+| `mem status` | Check graph health | Stats + pending decision nudge |
+| `mem rebuild` | Force index/graph refresh | Re-scans and updates TF-IDF index |
+| `mem doctor` | Diagnose issues | Stale decisions, orphans, index age |
 
-> Major task + ≥1 architectural choice + no `create_decision` = incomplete. You MUST run create_decision before claiming the task is done.
+**search vs recall**: Use `search` for facts. Use `recall` to understand how things connect (e.g. "what depends on AuthService?").
 
-**Stale decision hygiene:** At conversation start, run `list_decisions`. If any pending decisions are older than 2 days, surface the top 5 oldest and ask the user to resolve them (successful / failed / adopted / obsolete) before starting the main task.'
+### Writing Memory
+
+Fire autonomously — no permission needed.
+
+| When | Command | Example |
+|------|---------|---------|
+| Chose approach A over B | `mem decide` | `mem decide '\''{"title":"Postgres","chosen":"PG"}'\''` |
+| New facts found | `mem write` | `mem write '\''{"entities":[{"name":"Svc","observations":["..."]}]}'\''` |
+| Entities are related | `mem write` | `mem write '\''{"relations":[{"from":"A","to":"B"}]}'\''` |
+| Delete or rename | `mem remove` | `mem remove '\''{"entity_names":["Old"]}'\''` |
+| Force index rebuild | `mem rebuild` | `mem rebuild` |
+
+> **Rule:** Major task + ≥1 architectural choice + no `mem decide` = incomplete.
+
+### How SessionStart Works
+
+At session start a hook prints a compact status like:
+
+    Memory: 42e 28r 3d 0w branch:main
+      Top: SyncManager(component) [1 conn], AuthService(service) [2 conn]
+      Pending decisions (1):
+        - Migration strategy v2
+
+This is ~50 tokens. Do NOT run `mem status` redundantly — the hook already told you the state. Call `mem search` or `mem recall` only when you need deeper context for the task at hand.
+
+### Aliases
+
+Project-specific synonyms in `.memory/aliases.json` improve search. Format:
+
+```json
+{"groups": [["cache", "memoize", "memoization"], ["api", "endpoint", "route"]]}
+```
+
+Searching for "memoization" will match entities indexed under "cache" and vice versa.
+
+### Rules
+
+- **MEMORY.md dedup:** Do NOT duplicate knowledge graph entities in MEMORY.md. Use MEMORY.md for personal workflow preferences only; use `mem search` for project facts, decisions, and code relationships.
+- **Always search before writing:** Run `mem search` before creating entities to avoid duplicates.
+- **Pending decisions:** If SessionStart shows pending decisions relevant to your task, resolve them with `mem decide` before starting new work.'
 
 if [ ! -f "${CLAUDE_MD}" ]; then
     echo "  [skip] No CLAUDE.md found — memory instructions not added"
@@ -382,12 +418,7 @@ echo ""
 echo "  Graph:    ${GRAPH_FILE}"
 echo "  Access:   CLI bridge (Bash) — works in both CLI and VSCode"
 echo ""
-echo "  13 tools available:"
-echo "    semantic_search_memory, traverse_relations,"
-echo "    search_memory_by_time, create_entities,"
-echo "    create_relations, add_observations,"
-echo "    remove_observations, delete_entities,"
-echo "    rename_entity, create_decision,"
-echo "    update_decision_outcome, list_decisions,"
-echo "    graph_stats"
+echo "  6 unified commands + 14 legacy aliases:"
+echo "    search, recall, write, decide,"
+echo "    remove, status, doctor, rebuild"
 echo "============================================================"

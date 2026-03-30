@@ -282,21 +282,23 @@ PYEOF
 
     # 5. Remove Memory Graph Plugin section from CLAUDE.md
     if [ -f "${dir}/CLAUDE.md" ]; then
-        if grep -q '## Memory Graph Plugin' "${dir}/CLAUDE.md" 2>/dev/null; then
+        if grep -qE '## Memory Graph( Plugin)?' "${dir}/CLAUDE.md" 2>/dev/null; then
             if $DRY_RUN; then
-                echo "  [dry-run] Would remove Memory Graph Plugin section from CLAUDE.md"
-            elif confirm "Remove Memory Graph Plugin section from CLAUDE.md?"; then
+                echo "  [dry-run] Would remove Memory Graph section from CLAUDE.md"
+            elif confirm "Remove Memory Graph section from CLAUDE.md?"; then
                 python3 - "${dir}/CLAUDE.md" << 'PYEOF'
-import sys, os
+import sys, os, re
 
 path = sys.argv[1]
-marker = "## Memory Graph Plugin"
 with open(path, encoding="utf-8") as f:
     content = f.read()
 
-start = content.find(marker)
-if start < 0:
+# Match both old "## Memory Graph Plugin" and new "## Memory Graph"
+m = re.search(r'^## Memory Graph( Plugin)?', content, re.MULTILINE)
+if not m:
     sys.exit(0)
+start = m.start()
+marker = m.group(0)
 
 # Find end: next ## heading or EOF
 end = content.find("\n## ", start + len(marker))
@@ -313,7 +315,7 @@ with open(tmp, "w", encoding="utf-8") as f:
     f.flush()
     os.fsync(f.fileno())
 os.replace(tmp, path)
-print('  \033[0;32m[removed]\033[0m Memory Graph Plugin section from CLAUDE.md')
+print('  \033[0;32m[removed]\033[0m Memory Graph section from CLAUDE.md')
 PYEOF
             fi
         else

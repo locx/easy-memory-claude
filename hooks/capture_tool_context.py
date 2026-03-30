@@ -25,8 +25,13 @@ def _check_file_warnings(graph_path, filename, session_id):
     marker = (
         f"/tmp/.claude-mem-warned-{safe_sid}-{safe_file}"
     )
-    if os.path.exists(marker):
-        return ""
+    try:
+        marker_age = time.time() - os.path.getmtime(marker)
+        if 0 <= marker_age < 86400:  # suppress for 24h only
+            return ""
+        os.unlink(marker)  # expired — re-surface warning
+    except OSError:
+        pass  # marker doesn't exist — proceed
 
     basename = os.path.basename(filename)
     match_names = {basename, filename}
@@ -126,7 +131,7 @@ def main():
         with open(input_path, encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        sys.exit(0)
+        sys.exit(1)
 
     tool = data.get('tool_name', '')
     if tool not in ('Edit', 'Write', 'Bash', 'NotebookEdit'):
@@ -177,6 +182,11 @@ def main():
     try:
         if os.path.getsize(pending_path) \
                 >= _MAX_PENDING_BYTES:
+            print(
+                "Warning: pending sidecar full, "
+                "observation skipped",
+                file=sys.stderr,
+            )
             return
     except OSError:
         pass
@@ -203,6 +213,7 @@ def _write_direct(graph_path, entry):
         os.path.dirname(graph_path), '.graph.lock'
     )
     acquired = False
+    lock_fd = None
     if fcntl is not None:
         try:
             lock_fd = open(lock_path, 'a')
@@ -220,8 +231,11 @@ def _write_direct(graph_path, entry):
                     delay *= 2
             if not acquired:
                 lock_fd.close()
+                lock_fd = None
                 return False
         except OSError:
+            if lock_fd is not None:
+                lock_fd.close()
             return False
     try:
         with open(

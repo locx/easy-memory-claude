@@ -168,8 +168,38 @@ def create_relations(relations_input, memory_dir):
     return {"created": len(new_entries)}
 
 
-def add_observations(entity_name, observations,
-                     memory_dir):
+_NEG_WORDS = frozenset({
+    "not", "no", "never", "dont", "doesnt",
+    "removed", "deprecated", "reverted",
+    "disabled", "dropped", "replaced",
+    "incorrect", "wrong", "broken",
+})
+
+
+def _detect_contradictions(new_obs, existing_obs):
+    conflicts = []
+    for new_o in new_obs:
+        new_lower = set(new_o.lower().split())
+        new_has_neg = bool(new_lower & _NEG_WORDS)
+        for exist_o in existing_obs:
+            if not isinstance(exist_o, str):
+                continue
+            exist_lower = set(exist_o.lower().split())
+            exist_has_neg = bool(exist_lower & _NEG_WORDS)
+            if new_has_neg != exist_has_neg:
+                shared = (new_lower & exist_lower) - {
+                    "the", "a", "is", "are", "was", "to", "in", "for", "and", "of", "it", "this", "that", "with"
+                }
+                if len(shared) >= 3:
+                    conflicts.append({"new": new_o[:100], "existing": exist_o[:100]})
+            if len(conflicts) >= 3:
+                break
+        if len(conflicts) >= 3:
+            break
+    return conflicts
+
+
+def add_observations(entity_name, observations, memory_dir):
     """Add observations to an existing entity."""
     if not isinstance(entity_name, str) \
             or not entity_name:
@@ -223,6 +253,7 @@ def add_observations(entity_name, observations,
         }
     etype = info.get("entityType", "")
     created = info.get("_created", now)
+    conflicts = _detect_contradictions(new_obs, info.get("observations", []))
 
     if not append_jsonl(memory_dir, [{
         "type": "entity",
@@ -244,7 +275,14 @@ def add_observations(entity_name, observations,
         "ADD_OBS",
         f'entity="{entity_name}" added={total}',
     )
-    return {"added": total}
+    result = {"added": total}
+    if conflicts:
+        result["conflicts"] = conflicts
+        result["warning"] = (
+            f"{len(conflicts)} potential "
+            f"contradiction(s) detected"
+        )
+    return result
 
 
 def delete_entities(entity_names, memory_dir,
@@ -318,6 +356,34 @@ def delete_entities(entity_names, memory_dir,
     }
 
 
+def _build_decision_obs(args):
+    """Cleanly extract strings into an observation list for decisions."""
+    rationale = args.get("rationale", "")
+    obs = [f"Rationale: {rationale[:MAX_OBS_LENGTH]}"]
+    
+    alts = args.get("alternatives", [])
+    if isinstance(alts, list):
+        for alt in alts[:10]:
+            if isinstance(alt, str) and alt.strip():
+                obs.append(f"Alternative rejected: {alt[:MAX_OBS_LENGTH]}")
+                
+    scope = args.get("scope", "")
+    if isinstance(scope, str) and scope.strip():
+        obs.append(f"Scope: {scope[:MAX_OBS_LENGTH]}")
+        
+    chosen = args.get("chosen", "")
+    if isinstance(chosen, str) and chosen.strip():
+        obs.append(f"Chosen: {chosen[:MAX_OBS_LENGTH]}")
+        
+    outcome = args.get("outcome", "pending")
+    if outcome not in (
+        "pending", "successful", "failed", "revised",
+        "adopted", "rejected", "deferred", "obsolete",
+    ):
+        outcome = "pending"
+    obs.append(f"Outcome: {outcome}")
+    return obs, outcome
+
 def create_decision(args, memory_dir):
     """Create a structured decision entity with relations."""
     if not isinstance(args, dict):
@@ -331,34 +397,7 @@ def create_decision(args, memory_dir):
     if not rationale or not isinstance(rationale, str):
         return {"error": "rationale is required"}
 
-    obs = [f"Rationale: {rationale[:MAX_OBS_LENGTH]}"]
-
-    alternatives = args.get("alternatives", [])
-    if isinstance(alternatives, list):
-        for alt in alternatives[:10]:
-            if isinstance(alt, str) and alt.strip():
-                obs.append(
-                    f"Alternative rejected: "
-                    f"{alt[:MAX_OBS_LENGTH]}"
-                )
-
-    scope = args.get("scope", "")
-    if isinstance(scope, str) and scope.strip():
-        obs.append(
-            f"Scope: {scope[:MAX_OBS_LENGTH]}"
-        )
-
-    chosen = args.get("chosen", "")
-    if isinstance(chosen, str) and chosen.strip():
-        obs.append(f"Chosen: {chosen[:MAX_OBS_LENGTH]}")
-
-    outcome = args.get("outcome", "pending")
-    if outcome not in (
-        "pending", "successful", "failed", "revised",
-        "adopted", "rejected", "deferred", "obsolete",
-    ):
-        outcome = "pending"
-    obs.append(f"Outcome: {outcome}")
+    obs, outcome = _build_decision_obs(args)
 
     entity_name = f"{_DECISION_PREFIX}{title}"
     result = create_entities(
