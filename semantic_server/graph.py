@@ -71,10 +71,11 @@ def _merge_ts(prev, created, updated):
 
 
 def get_graph_mtime(memory_dir):
-    """Get graph.jsonl mtime, or None if missing."""
+    """Get graph.jsonl (mtime, size) tuple, or None if missing."""
     graph_path = os.path.join(memory_dir, "graph.jsonl")
     try:
-        return graph_path, os.path.getmtime(graph_path)
+        st = os.stat(graph_path)
+        return graph_path, (st.st_mtime, st.st_size)
     except OSError:
         return graph_path, None
 
@@ -93,6 +94,9 @@ def _iter_graph_lines(f, start_offset, max_incr_bytes, deadline):
             continue
         line = raw.decode("utf-8", errors="replace")
         if "\ufffd" in line:
+            sys.stderr.write(
+                f"warn: skipped invalid UTF-8 at offset {f.tell()}\n"
+            )
             continue
         line = line.strip()
         if not line:

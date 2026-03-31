@@ -114,6 +114,7 @@ def flush_recall_counts():
                     separators=(",", ":"),
                 )
                 f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, recall_path)
             recall_dirty = False
             try:

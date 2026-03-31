@@ -21,7 +21,10 @@ def _check_file_warnings(graph_path, filename, session_id):
         c if c.isalnum() or c in ('_', '-')
         else '_' for c in session_id
     )[:64]
-    safe_file = os.path.basename(filename)[:64]
+    safe_file = "".join(
+        c if c.isalnum() or c in ('_', '-')
+        else '_' for c in os.path.basename(filename)
+    )[:64]
     marker = (
         f"/tmp/.claude-mem-warned-{safe_sid}-{safe_file}"
     )

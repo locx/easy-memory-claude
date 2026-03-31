@@ -172,6 +172,7 @@ def consolidate(entities, relations, min_merge_name_len=4):
                 continue
 
             ent_j = entities[idx_j]
+            len_j = len(norm_j)
             if not _can_merge(ent_i, ent_j, norm_i, norm_j, len_i, len_j, guard_cutoff, min_merge_name_len):
                 continue
             
@@ -194,6 +195,10 @@ def consolidate(entities, relations, min_merge_name_len=4):
             merged_count += 1
         
         if total_comparisons > _MAX_COMPARISONS:
+            sys.stderr.write(
+                f"warn: consolidation cap reached after "
+                f"{merged_count} merges, remaining entities skipped\n"
+            )
             break
         if obs_dict_i is not None:
             ent_i["observations"] = list(obs_dict_i)

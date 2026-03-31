@@ -673,8 +673,7 @@ def remove_observations(entity_name, observations,
 
     info = entities[entity_name]
     cur_obs = info.get("observations", [])
-    to_remove = {o for o in observations
-                 if isinstance(o, str)}
+    to_remove = {_obs_dedup_key(o) for o in observations}
     kept = [o for o in cur_obs
             if _obs_dedup_key(o) not in to_remove]
     removed = len(cur_obs) - len(kept)

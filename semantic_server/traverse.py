@@ -62,6 +62,8 @@ def _expand_frontier(frontier, direction, outbound, inbound, visited, seen_edges
                 continue
             seen_edges.add(edge_key)
             target = to if fr == node else fr
+            if target == node:
+                continue
             edges.append({"from": fr, "to": to, "relationType": rt})
             if target not in visited:
                 if len(visited) >= _MAX_VISITED:
