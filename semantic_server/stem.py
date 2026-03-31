@@ -62,13 +62,19 @@ def porter_stem(word):
 
 # Stem cache — avoids re-stemming the same word
 _stem_cache = {}
+_STEM_CACHE_MAX = 50_000
 
 def stem_word(word):
-    """Cached Porter stem lookup."""
+    """Cached Porter stem lookup with bounded LRU eviction."""
     s = _stem_cache.get(word)
     if s is not None:
         return s
     s = porter_stem(word)
-    if len(_stem_cache) < 50_000:
-        _stem_cache[word] = s
+    if len(_stem_cache) >= _STEM_CACHE_MAX:
+        # Evict oldest half to amortize eviction cost
+        to_keep = _STEM_CACHE_MAX // 2
+        keys = list(_stem_cache.keys())
+        for k in keys[:len(keys) - to_keep]:
+            del _stem_cache[k]
+    _stem_cache[word] = s
     return s

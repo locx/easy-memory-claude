@@ -124,7 +124,7 @@ def traverse_relations(entity, memory_dir,
             break
 
     nodes = []
-    for name in visited:
+    for name in sorted(visited):
         info = entities.get(name, {})
         nodes.append({
             "name": name,

@@ -314,7 +314,7 @@ def load_graph_entities(memory_dir):
                 _merge_incremental_data(existing, new_ents, new_rels)
                 entity_cache["mtime"] = mtime
                 entity_cache["offset"] = offset
-                entity_cache["size"] += (estimate_size(new_ents) if new_ents else 0)
+                entity_cache["size"] = estimate_size(existing)
                 entity_cache["append_only"] = False
                 entity_cache.pop("_pre_invalidate_mtime", None)
                 if relation_cache["data"] is not None:
