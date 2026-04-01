@@ -1,6 +1,7 @@
 """TF-IDF cosine similarity search and time-based search."""
 import heapq
 import math
+import os as _os
 import sys
 import time as _time
 from collections import Counter

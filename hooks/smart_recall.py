@@ -94,6 +94,46 @@ def _read_recall_counts(memory_dir):
         return {}
 
 
+def _count_native_memories(project_dir):
+    """Count native auto-memory files by type.
+
+    SYNC NOTE: Path derivation duplicated in memory-cli.py
+    (_resolve_native_memory_dir). Keep both in sync.
+    """
+    key = project_dir.lstrip("/").replace("/", "-")
+    native_dir = os.path.join(
+        os.path.expanduser("~"), ".claude", "projects",
+        f"-{key}", "memory",
+    )
+    if not os.path.isdir(native_dir):
+        return 0, {}
+    counts = {}
+    total = 0
+    for fname in os.listdir(native_dir):
+        if not fname.endswith('.md') or fname == 'MEMORY.md':
+            continue
+        fpath = os.path.join(native_dir, fname)
+        mem_type = "unknown"
+        try:
+            with open(fpath, encoding='utf-8') as f:
+                in_fm = False
+                for line in f:
+                    stripped = line.strip()
+                    if stripped == '---':
+                        if in_fm:
+                            break
+                        in_fm = True
+                        continue
+                    if in_fm and stripped.startswith('type:'):
+                        mem_type = stripped.split(':', 1)[1].strip()
+                        break
+        except OSError:
+            continue
+        counts[mem_type] = counts.get(mem_type, 0) + 1
+        total += 1
+    return total, counts
+
+
 _MAX_ENTITY_COUNT = 100_000
 _MAX_LINE_LEN = 10_000_000
 _PARSE_TIME_BUDGET = 10.0
@@ -314,11 +354,21 @@ def main():
     n_dec = type_counts.get("decision", 0)
     n_warn = type_counts.get("file-warning", 0)
 
+    # Native memory count
+    n_native, native_types = _count_native_memories(project_dir)
+    native_str = ""
+    if n_native:
+        type_parts = ", ".join(
+            f"{c} {t}" for t, c in native_types.items()
+        )
+        native_str = f" | Native: {n_native} ({type_parts})"
+
     # Tier 1: Compact status line (~50 tokens total)
     print(
         f"Memory: {n_ent}e {n_rel}r "
         f"{n_dec}d {n_warn}w"
-        + (f" branch:{current_branch}"
+        + native_str
+        + (f" | branch:{current_branch}"
            if current_branch else "")
     )
     _print_compact_entities(scored, adj)

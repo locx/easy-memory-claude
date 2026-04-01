@@ -1,20 +1,16 @@
 #!/bin/bash
 # SessionStart hook: run maintenance + smart memory recall.
 # Global — works for any project with .memory/ dir.
+# Runs in both CLI and VSCode (maintenance is always useful).
 
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] || exit 0
-
-# VSCode extension runs hooks but discards output — skip entirely
-[ -z "${VSCODE_PID:-}" ] && [ -z "${VSCODE_IPC_HOOK:-}" ] \
-    && [ "${TERM_PROGRAM:-}" != "vscode" ] \
-    || exit 0
 
 MEMORY_DIR="${CLAUDE_PROJECT_DIR}/.memory"
 
 # Skip if project has no memory setup
 [ -d "${MEMORY_DIR}" ] || exit 0
 
-# Run maintenance (throttled internally to 1x/day)
+# Run maintenance regardless of environment (throttled internally to 1x/day)
 if [ -f "${HOME}/.claude/memory/maintenance.py" ]; then
     ERR_LOG="${MEMORY_DIR}/maintenance.err"
     # Rotate error log if >100KB
@@ -33,8 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || exit 1
 if [ -f "${SCRIPT_DIR}/smart_recall.py" ]; then
     python3 "${SCRIPT_DIR}/smart_recall.py" "${MEMORY_DIR}" 2>/dev/null
 else
-    # Fallback if smart_recall.py missing
-    echo "Memory tools: semantic_search_memory | traverse_relations | create_entities | create_decision | graph_stats"
+    echo "Memory: use \`mem search <query>\` or \`mem recall <query>\` for details."
 fi
 
 exit 0

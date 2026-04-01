@@ -2,16 +2,19 @@
 # mem — short wrapper for easy-memory-claude CLI.
 # Resolves MEMORY_DIR from git root or upwards automatically.
 # Usage:
-#   mem search auth
-#   mem search auth --top-k 5 --compact
-#   mem write '{"entities":[...]}'
-#   mem recall auth
-#   mem status
-#   mem decide '{"title":"...","rationale":"..."}'
-#   mem remove '{"entity_names":["..."]}'
-#   mem doctor
-#   mem rebuild
-#   mem <legacy_tool_name> '<json>'
+#   mem search auth                  # Search both graph + native memory
+#   mem search auth --top-k 5        # Limit results
+#   mem recall auth                  # Search + 1-hop graph neighbors
+#   mem write '{"entities":[...]}'   # Create graph entities/relations
+#   mem decide '{"title":"..."}'     # Decision journal
+#   mem remember "text"              # Write to native auto-memory
+#   mem remember --type feedback "x" # With explicit type
+#   mem forget "name"                # Remove native memory
+#   mem sync                         # Sync native -> graph
+#   mem remove '{"entity_names":[]}' # Delete graph entities
+#   mem status                       # Health of both systems
+#   mem doctor                       # Diagnostics across both stores
+#   mem rebuild                      # Rebuild TF-IDF index
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

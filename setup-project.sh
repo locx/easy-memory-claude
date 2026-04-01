@@ -2,7 +2,7 @@
 # Initialize a project for Claude memory infrastructure.
 # Usage: setup-project.sh [project_dir]
 #
-# Creates .memory/, removes legacy MCP configs, bootstraps graph.
+# Creates .memory/, removes legacy MCP configs, migrates auto-memory.
 # Safe to re-run — skips existing files, merges configs.
 set -euo pipefail
 
@@ -123,193 +123,128 @@ else
     echo "  [ok] Created .gitignore with .memory/"
 fi
 
-# ---- 7. Bootstrap: scan project and seed graph ----
-if [ ! -s "${GRAPH_FILE}" ]; then
-    echo ""
-    echo "[bootstrap] Scanning project structure..."
-    python3 - "${PROJECT_DIR}" "${GRAPH_FILE}" "${PROJECT_NAME}" << 'PYEOF'
-import json, os, sys, time
+# ---- 7. Migrate built-in auto-memory into graph ----
+# Claude Code's built-in auto-memory writes .md files to
+# ~/.claude/projects/-<path-with-slashes-as-dashes>/memory/
+# Parse those files and import as graph entities so nothing is lost.
+AUTO_MEM_KEY=$(echo "${PROJECT_DIR}" | sed 's|^/||; s|/|-|g')
+AUTO_MEM_DIR="${CLAUDE_HOME}/projects/-${AUTO_MEM_KEY}/memory"
 
-project_dir = sys.argv[1]
+if [ -d "${AUTO_MEM_DIR}" ]; then
+    python3 - "${AUTO_MEM_DIR}" "${GRAPH_FILE}" << 'PYEOF'
+import json, os, sys, time, re
+
+auto_mem_dir = sys.argv[1]
 graph_path = sys.argv[2]
-project_name = sys.argv[3]
-
 now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
-# Collect project files by extension
-ext_map = {
-    '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
-    '.tsx': 'TypeScript', '.jsx': 'JavaScript',
-    '.rs': 'Rust', '.go': 'Go', '.java': 'Java',
-    '.swift': 'Swift', '.sh': 'Shell', '.sql': 'SQL',
-    '.md': 'Documentation', '.json': 'Config',
-    '.yaml': 'Config', '.yml': 'Config', '.toml': 'Config',
-}
+# Load existing entity names to avoid duplicates
+existing = set()
+if os.path.isfile(graph_path):
+    with open(graph_path, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                if rec.get('type') == 'entity':
+                    existing.add(rec['name'])
+            except (json.JSONDecodeError, KeyError):
+                pass
 
-skip_dirs = {
-    '.git', '.memory', 'node_modules', '__pycache__',
-    '.venv', 'venv', '.tox', 'dist', 'build', '.eggs',
-    '.mypy_cache', '.pytest_cache', '.ruff_cache',
-    'target', '.next', '.nuxt',
-}
+migrated = 0
+for fname in sorted(os.listdir(auto_mem_dir)):
+    if not fname.endswith('.md') or fname == 'MEMORY.md':
+        continue
+    fpath = os.path.join(auto_mem_dir, fname)
+    try:
+        with open(fpath, encoding='utf-8') as f:
+            content = f.read()
+    except OSError:
+        continue
 
-entities = []
-relations = []
-dir_modules = {}  # track directories as modules
-file_count = 0
-tech_seen = set()
+    # Parse YAML frontmatter
+    fm = {}
+    body = content
+    m = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+    if m:
+        body = content[m.end():]
+        for line in m.group(1).splitlines():
+            k, _, v = line.partition(':')
+            k, v = k.strip(), v.strip()
+            if k and v:
+                fm[k] = v
 
-for root, dirs, files in os.walk(project_dir):
-    # Prune skip dirs
-    dirs[:] = [
-        d for d in dirs
-        if d not in skip_dirs and not d.startswith('.')
-    ]
-    rel_root = os.path.relpath(root, project_dir)
-    if rel_root == '.':
-        rel_root = ''
+    name = fm.get('name', os.path.splitext(fname)[0])
+    entity_type = fm.get('type', 'reference')
+    desc = fm.get('description', '')
 
-    for fname in sorted(files):
-        if fname.startswith('.'):
-            continue
-        ext = os.path.splitext(fname)[1].lower()
-        if ext not in ext_map:
-            continue
+    # Build observations from body lines
+    observations = []
+    if desc:
+        observations.append(desc)
+    for line in body.strip().splitlines():
+        line = line.strip()
+        if line and len(line) > 3:
+            observations.append(line[:200])
 
-        file_count += 1
-        if file_count > 200:
-            break
+    if not observations:
+        continue
+    # Prefix name to avoid collision with code entities
+    entity_name = f'auto-memory: {name}'
+    if entity_name in existing:
+        continue
 
-        rel_path = os.path.join(rel_root, fname) \
-            if rel_root else fname
-        tech = ext_map[ext]
-        tech_seen.add(tech)
-
-        # Read first 5 lines for observation
-        obs = [f'{tech} file']
-        fpath = os.path.join(root, fname)
-        try:
-            with open(fpath, encoding='utf-8',
-                      errors='ignore') as f:
-                lines = []
-                for i, line in enumerate(f):
-                    if i >= 5:
-                        break
-                    lines.append(line.rstrip())
-                # Extract docstring or first comment
-                for line in lines:
-                    stripped = line.strip()
-                    if stripped.startswith(('#', '//', '/*',
-                                           '"""', "'''")):
-                        clean = stripped.lstrip(
-                            '#/ *"\''
-                        ).rstrip('*/"\' ')
-                        if len(clean) > 5:
-                            obs.append(clean[:120])
-                            break
-        except OSError:
-            pass
-
-        entities.append({
-            'type': 'entity',
-            'name': rel_path,
-            'entityType': 'Module',
-            'observations': obs,
-            '_created': now,
-            '_updated': now,
-        })
-
-        # Relate file to its directory
-        if rel_root:
-            dir_name = rel_root + '/'
-            if dir_name not in dir_modules:
-                dir_modules[dir_name] = True
-                entities.append({
-                    'type': 'entity',
-                    'name': dir_name,
-                    'entityType': 'Component',
-                    'observations': [f'Directory in {project_name}'],
-                    '_created': now,
-                    '_updated': now,
-                })
-            relations.append({
-                'type': 'relation',
-                'from': dir_name,
-                'to': rel_path,
-                'relationType': 'contains',
-            })
-
-    if file_count > 200:
-        break
-
-# Add project entity
-entities.insert(0, {
-    'type': 'entity',
-    'name': project_name,
-    'entityType': 'Project',
-    'observations': [
-        f'{file_count} source files scanned',
-        f'Technologies: {", ".join(sorted(tech_seen))}',
-    ],
-    '_created': now,
-    '_updated': now,
-})
-
-# Relate top-level dirs to project
-for d in dir_modules:
-    if '/' in d.rstrip('/'):
-        continue  # only top-level
-    relations.append({
-        'type': 'relation',
-        'from': project_name,
-        'to': d,
-        'relationType': 'contains',
-    })
-
-# Write graph atomically — temp file + os.replace
-tmp_path = graph_path + '.new'
-try:
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        for entry in entities + relations:
-            f.write(json.dumps(entry, separators=(',', ':')) + '\n')
+    entity = {
+        'type': 'entity',
+        'name': entity_name,
+        'entityType': entity_type,
+        'observations': observations,
+        '_created': now,
+        '_updated': now,
+        '_migrated_from': 'auto-memory',
+    }
+    with open(graph_path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(entity, separators=(',', ':')) + '\n')
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp_path, graph_path)
-except BaseException:
-    try:
-        os.unlink(tmp_path)
-    except OSError:
-        pass
-    raise
+    existing.add(entity_name)
+    migrated += 1
 
-e_count = len(entities)
-r_count = len(relations)
-print(f'  [ok] Bootstrapped: {e_count} entities, '
-      f'{r_count} relations')
+if migrated:
+    print(f'  [ok] Migrated {migrated} auto-memory entries into graph')
+else:
+    print(f'  [skip] No new auto-memory entries to migrate')
 PYEOF
-
-    # Build TF-IDF index immediately
-    if [ -s "${GRAPH_FILE}" ]; then
-        echo "[bootstrap] Building TF-IDF index..."
-        python3 "${CLAUDE_HOME}/memory/maintenance.py" "${PROJECT_DIR}" 2>/dev/null || true
-        if [ -f "${MEMORY_DIR}/tfidf_index.json" ]; then
-            IDX_KB=$(( $(wc -c < "${MEMORY_DIR}/tfidf_index.json" | tr -d ' ') / 1024 ))
-            echo "  [ok] TF-IDF index: ${IDX_KB}KB"
-        fi
-    fi
 else
-    echo ""
-    echo "  [skip] Graph already has data — skipping bootstrap"
+    echo "  [skip] No built-in auto-memory found for this project"
 fi
 
-# ---- 8. Add/update memory plugin instructions in CLAUDE.md ----
+# ---- 8. Build TF-IDF index if graph has data ----
+if [ -s "${GRAPH_FILE}" ]; then
+    echo ""
+    echo "[index] Building TF-IDF index..."
+    python3 "${CLAUDE_HOME}/memory/maintenance.py" "${PROJECT_DIR}" 2>/dev/null || true
+    if [ -f "${MEMORY_DIR}/tfidf_index.json" ]; then
+        IDX_KB=$(( $(wc -c < "${MEMORY_DIR}/tfidf_index.json" | tr -d ' ') / 1024 ))
+        echo "  [ok] TF-IDF index: ${IDX_KB}KB"
+    fi
+fi
+
+# ---- 9. Add/update memory plugin instructions in CLAUDE.md ----
 CLAUDE_MD="${PROJECT_DIR}/CLAUDE.md"
 MEMORY_MARKER="## Memory Graph"
 
 MEMORY_SECTION='
 ## Memory Graph
 
-Persistent knowledge graph at `.memory/`. All commands use `mem`:
+Unified memory gateway via `mem`. Two stores, one interface:
+
+- **Knowledge graph** (`.memory/`): Entities, relations, decisions — searchable, scored, branch-aware
+- **Native memory** (`~/.claude/projects/.../memory/`): User prefs, feedback, references — always loaded in context
+
+All commands:
 
     mem <command> [args]
 
@@ -319,11 +254,11 @@ SessionStart automatically prints a compact status line. Use these commands **on
 
 | Command | When to use | What it returns |
 |---------|-------------|-----------------|
-| `mem search <query>` | Need context on a topic | Ranked entities with observations |
-| `mem recall <query>` | Need context + relationships | Search results + 1-hop graph neighbors |
-| `mem status` | Check graph health | Stats + pending decision nudge |
-| `mem rebuild` | Force index/graph refresh | Re-scans and updates TF-IDF index |
-| `mem doctor` | Diagnose issues | Stale decisions, orphans, index age |
+| `mem search <query>` | Need context on a topic | Results from both graph + native memory |
+| `mem recall <query>` | Need context + relationships | Search + 1-hop graph neighbors |
+| `mem status` | Check health of both systems | Graph stats + native counts + decision nudge |
+| `mem doctor` | Diagnose issues | Health checks across both stores |
+| `mem rebuild` | Force index refresh | Re-scans and updates TF-IDF index |
 
 **search vs recall**: Use `search` for facts. Use `recall` to understand how things connect (e.g. "what depends on AuthService?").
 
@@ -331,26 +266,40 @@ SessionStart automatically prints a compact status line. Use these commands **on
 
 Fire autonomously — no permission needed.
 
-| When | Command | Example |
-|------|---------|---------|
-| Chose approach A over B | `mem decide` | `mem decide '\''{"title":"Postgres","chosen":"PG"}'\''` |
-| New facts found | `mem write` | `mem write '\''{"entities":[{"name":"Svc","observations":["..."]}]}'\''` |
-| Entities are related | `mem write` | `mem write '\''{"relations":[{"from":"A","to":"B"}]}'\''` |
-| Delete or rename | `mem remove` | `mem remove '\''{"entity_names":["Old"]}'\''` |
-| Force index rebuild | `mem rebuild` | `mem rebuild` |
+| What to store | Command | Example |
+|---------------|---------|---------|
+| User prefs, feedback, role | `mem remember` | `mem remember --type feedback "Don'\''t mock the DB"` |
+| Project decisions, rationale | `mem decide` | `mem decide '\''{"title":"Postgres","chosen":"PG"}'\''` |
+| Code entities, architecture | `mem write` | `mem write '\''{"entities":[{"name":"Svc","observations":["..."]}]}'\''` |
+| Entity relationships | `mem write` | `mem write '\''{"relations":[{"from":"A","to":"B"}]}'\''` |
+| Quick references | `mem remember` | `mem remember --type reference --name "api-docs" "See confluence/api"` |
+| Remove native memory | `mem forget` | `mem forget "memory-name"` |
+| Remove graph entities | `mem remove` | `mem remove '\''{"entity_names":["Old"]}'\''` |
+| Sync both stores | `mem sync` | `mem sync` |
 
-> **Rule:** Major task + ≥1 architectural choice + no `mem decide` = incomplete.
+### Memory Routing
+
+**Native memory** (via `mem remember`) loads automatically every session at zero token cost. Use for:
+- Your role, expertise, preferences (`--type user`)
+- Corrections and workflow feedback (`--type feedback`)
+- External references, links (`--type reference`)
+
+**Knowledge graph** (via `mem write`/`mem decide`) requires `mem search` to query but supports relations, scoring, and decay. Use for:
+- Architectural decisions and their rationale
+- Code component relationships
+- File warnings and known issues
+- Facts that benefit from graph traversal
+
+> **Rule:** Major task + >=1 architectural choice + no `mem decide` = incomplete.
 
 ### How SessionStart Works
 
 At session start a hook prints a compact status like:
 
-    Memory: 42e 28r 3d 0w branch:main
+    Memory: 42e 28r 3d 0w | Native: 3 (1 user, 1 feedback, 1 project) | branch:main
       Top: SyncManager(component) [1 conn], AuthService(service) [2 conn]
-      Pending decisions (1):
-        - Migration strategy v2
 
-This is ~50 tokens. Do NOT run `mem status` redundantly — the hook already told you the state. Call `mem search` or `mem recall` only when you need deeper context for the task at hand.
+This is ~50 tokens. Call `mem search` or `mem recall` only when you need deeper context.
 
 ### Aliases
 
@@ -360,13 +309,12 @@ Project-specific synonyms in `.memory/aliases.json` improve search. Format:
 {"groups": [["cache", "memoize", "memoization"], ["api", "endpoint", "route"]]}
 ```
 
-Searching for "memoization" will match entities indexed under "cache" and vice versa.
-
 ### Rules
 
-- **MEMORY.md dedup:** Do NOT duplicate knowledge graph entities in MEMORY.md. Use MEMORY.md for personal workflow preferences only; use `mem search` for project facts, decisions, and code relationships.
 - **Always search before writing:** Run `mem search` before creating entities to avoid duplicates.
-- **Pending decisions:** If SessionStart shows pending decisions relevant to your task, resolve them with `mem decide` before starting new work.'
+- **Pending decisions:** If SessionStart shows pending decisions relevant to your task, resolve them with `mem decide` before starting new work.
+- **Use the right store:** Native memory for personal context (always loaded). Graph for project knowledge (searchable, relational).
+- **`mem` is the gateway:** All memory operations go through `mem` commands. Do not write to native memory files or graph.jsonl directly.'
 
 if [ ! -f "${CLAUDE_MD}" ]; then
     echo "  [skip] No CLAUDE.md found — memory instructions not added"
@@ -418,7 +366,7 @@ echo ""
 echo "  Graph:    ${GRAPH_FILE}"
 echo "  Access:   CLI bridge (Bash) — works in both CLI and VSCode"
 echo ""
-echo "  6 unified commands + 14 legacy aliases:"
-echo "    search, recall, write, decide,"
-echo "    remove, status, doctor, rebuild"
+echo "  Commands:"
+echo "    search, recall, write, decide, remember,"
+echo "    forget, sync, remove, status, doctor, rebuild"
 echo "============================================================"
