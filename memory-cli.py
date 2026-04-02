@@ -246,6 +246,12 @@ def _usage():
         "Graph visualization (DOT format)\n"
         "  timeline [--global]     "
         "Recent activity across projects\n"
+        "  diff                    "
+        "Changes since last session\n"
+        "  context <filepath>      "
+        "File-specific entity recall\n"
+        "  impact <entity>         "
+        "Impact analysis via graph traversal\n"
         "\nLegacy tool names also work for "
         "backward compatibility.",
         file=sys.stderr,
@@ -299,6 +305,12 @@ def _parse_positional(args):
             result["name"] = args[i]
         elif arg == "--global":
             result["global"] = True
+        elif arg == "--depth" and i + 1 < len(args):
+            i += 1
+            try:
+                result["depth"] = int(args[i])
+            except ValueError:
+                pass
         elif not arg.startswith("--"):
             positionals.append(arg)
         i += 1
@@ -1108,6 +1120,476 @@ def _unified_status(a, memory_dir):
     return stats
 
 
+# --- New Intelligence Commands ---
+
+def _run_diff(memory_dir):
+    """Show entities changed since last session."""
+    import time
+    from datetime import datetime, timezone
+
+    marker = os.path.join(memory_dir, ".last-session-start")
+    try:
+        with open(marker) as f:
+            last_ts = f.read().strip()
+    except OSError:
+        last_ts = None
+
+    if not last_ts:
+        print("No previous session recorded. "
+              "Run `mem status` in a new session first.")
+        return
+
+    graph_path = os.path.join(memory_dir, "graph.jsonl")
+    new_entities = []
+    updated_entities = []
+    new_decisions = []
+    resolved_decisions = []
+
+    try:
+        with open(graph_path, encoding="utf-8") as f:
+            # Single-pass: collect latest state per entity
+            entities = {}
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get("type") != "entity":
+                        continue
+                    name = obj.get("name", "")
+                    if not name:
+                        continue
+                    if name in entities:
+                        prev = entities[name]
+                        new_u = obj.get("_updated", "")
+                        if new_u and (not prev.get("_updated")
+                                      or new_u > prev["_updated"]):
+                            prev["_updated"] = new_u
+                        for o in obj.get("observations", []):
+                            if isinstance(o, str):
+                                prev.setdefault(
+                                    "observations", []
+                                ).append(o)
+                    else:
+                        entities[name] = dict(obj)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except OSError:
+        print("Cannot read graph.")
+        return
+
+    for name, info in entities.items():
+        etype = info.get("entityType", "")
+        if etype == "activity-log":
+            continue
+        created = info.get("_created", "")
+        updated = info.get("_updated", "")
+        if created and created > last_ts:
+            entry = {"name": name, "type": etype,
+                     "timestamp": created}
+            if etype == "decision":
+                new_decisions.append(entry)
+            else:
+                new_entities.append(entry)
+        elif updated and updated > last_ts:
+            # Check if decision got resolved
+            if etype == "decision":
+                obs = info.get("observations", [])
+                resolved = any(
+                    isinstance(o, str)
+                    and o.startswith("Outcome: ")
+                    and not o.startswith("Outcome: pending")
+                    for o in obs
+                )
+                if resolved:
+                    resolved_decisions.append(
+                        {"name": name, "timestamp": updated}
+                    )
+                    continue
+            updated_entities.append(
+                {"name": name, "type": etype,
+                 "timestamp": updated}
+            )
+
+    if sys.stdout.isatty():
+        total = (len(new_entities) + len(updated_entities)
+                 + len(new_decisions) + len(resolved_decisions))
+        if total == 0:
+            print(f"No changes since {last_ts[:16]}.")
+            return
+        print(f"\n\033[1mChanges since {last_ts[:16]}\033[0m\n")
+        if new_entities:
+            print(f"  \033[32m+ New ({len(new_entities)}):\033[0m")
+            for e in new_entities[:10]:
+                tag = f" ({e['type']})" if e['type'] else ""
+                print(f"    {e['name']}{tag}")
+            if len(new_entities) > 10:
+                print(f"    +{len(new_entities) - 10} more")
+        if updated_entities:
+            print(
+                f"  \033[33m~ Updated "
+                f"({len(updated_entities)}):\033[0m"
+            )
+            for e in updated_entities[:10]:
+                tag = f" ({e['type']})" if e['type'] else ""
+                print(f"    {e['name']}{tag}")
+            if len(updated_entities) > 10:
+                print(
+                    f"    +{len(updated_entities) - 10} more"
+                )
+        if new_decisions:
+            print(
+                f"  \033[35mDecisions made "
+                f"({len(new_decisions)}):\033[0m"
+            )
+            for d in new_decisions[:5]:
+                name = d["name"]
+                if name.lower().startswith("decision: "):
+                    name = name[10:]
+                print(f"    {name}")
+        if resolved_decisions:
+            print(
+                f"  \033[36mDecisions resolved "
+                f"({len(resolved_decisions)}):\033[0m"
+            )
+            for d in resolved_decisions[:5]:
+                name = d["name"]
+                if name.lower().startswith("decision: "):
+                    name = name[10:]
+                print(f"    {name}")
+        print()
+    else:
+        print(json.dumps({
+            "since": last_ts,
+            "new": new_entities,
+            "updated": updated_entities,
+            "new_decisions": new_decisions,
+            "resolved_decisions": resolved_decisions,
+        }, indent=2))
+
+
+def _run_context(memory_dir, filepath):
+    """File-specific entity recall — show everything relevant to a file."""
+    from semantic_server.graph import (
+        load_graph_entities, load_graph_relations,
+    )
+    from semantic_server.search import search
+
+    if not filepath:
+        print(json.dumps({"error": "filepath required"}))
+        return
+
+    basename = os.path.basename(filepath).lower()
+    stem = os.path.splitext(basename)[0].lower()
+
+    entities = load_graph_entities(memory_dir)
+    relations = load_graph_relations(memory_dir)
+
+    # Find entities that mention this file
+    matched = []
+    for name, info in entities.items():
+        etype = info.get("entityType", "")
+        if etype == "activity-log":
+            continue
+        name_lower = name.lower()
+        # Direct name match
+        if basename in name_lower or stem in name_lower:
+            matched.append((name, info, "name_match"))
+            continue
+        # Observation match
+        for obs in info.get("observations", []):
+            if isinstance(obs, str) and (
+                basename in obs.lower()
+                or stem in obs.lower()
+            ):
+                matched.append((name, info, "observation"))
+                break
+
+    # Also run a search for the filename
+    sr = search(stem, memory_dir, top_k=5, compact=True)
+    search_names = {r.get("entity") for r in sr.get("results", [])}
+
+    # Build relation map for matched entities
+    rel_map = {}
+    for r in relations:
+        fr = r.get("from", "")
+        to = r.get("to", "")
+        rt = r.get("relationType", "")
+        rel_map.setdefault(fr, []).append((to, rt))
+        rel_map.setdefault(to, []).append((fr, rt))
+
+    # Categorize results
+    warnings = []
+    decisions = []
+    related = []
+    for name, info, match_type in matched:
+        etype = info.get("entityType", "")
+        if etype == "file-warning":
+            warnings.append((name, info))
+        elif etype == "decision":
+            decisions.append((name, info))
+        else:
+            related.append((name, info))
+
+    # Add search results not already matched
+    matched_names = {m[0] for m in matched}
+    for r in sr.get("results", []):
+        ename = r.get("entity", "")
+        if ename not in matched_names:
+            info = entities.get(ename, {})
+            if info:
+                etype = info.get("entityType", "")
+                if etype == "file-warning":
+                    warnings.append((ename, info))
+                elif etype == "decision":
+                    decisions.append((ename, info))
+                elif etype != "activity-log":
+                    related.append((ename, info))
+
+    if sys.stdout.isatty():
+        total = len(warnings) + len(decisions) + len(related)
+        if total == 0:
+            print(f"No context found for '{filepath}'.")
+            return
+        print(
+            f"\n\033[1mContext for {basename}\033[0m "
+            f"({total} entities)\n"
+        )
+        if warnings:
+            print(f"  \033[31mWarnings ({len(warnings)}):\033[0m")
+            for name, info in warnings:
+                for obs in info.get("observations", [])[:3]:
+                    if isinstance(obs, str):
+                        print(f"    ! {obs}")
+        if decisions:
+            print(f"  \033[35mDecisions ({len(decisions)}):\033[0m")
+            for name, info in decisions:
+                display = name
+                if display.lower().startswith("decision: "):
+                    display = display[10:]
+                obs = info.get("observations", [])
+                rationale = ""
+                outcome = "pending"
+                for o in obs:
+                    if isinstance(o, str):
+                        if o.startswith("Rationale: "):
+                            rationale = o[11:][:80]
+                        elif (o.startswith("Outcome: ")
+                              and not o.startswith(
+                                  "Outcome: pending")):
+                            outcome = o[9:]
+                print(f"    {display} [{outcome}]")
+                if rationale:
+                    print(f"      {rationale}")
+        if related:
+            print(f"  \033[36mRelated ({len(related)}):\033[0m")
+            for name, info in related[:10]:
+                etype = info.get("entityType", "")
+                tag = f" ({etype})" if etype else ""
+                conns = rel_map.get(name, [])
+                conn_str = ""
+                if conns:
+                    conn_names = [c[0] for c in conns[:3]]
+                    conn_str = (
+                        f" -> {', '.join(conn_names)}"
+                    )
+                print(f"    {name}{tag}{conn_str}")
+            if len(related) > 10:
+                print(f"    +{len(related) - 10} more")
+        print()
+    else:
+        print(json.dumps({
+            "file": filepath,
+            "warnings": [
+                {"name": n, "observations": i.get(
+                    "observations", [])[:3]}
+                for n, i in warnings
+            ],
+            "decisions": [
+                {"name": n, "observations": i.get(
+                    "observations", [])[:3]}
+                for n, i in decisions
+            ],
+            "related": [
+                {"name": n, "entityType": i.get(
+                    "entityType", "")}
+                for n, i in related
+            ],
+        }, indent=2))
+
+
+def _run_impact(memory_dir, entity_name, max_depth=3):
+    """Impact analysis: what depends on this entity."""
+    from semantic_server.graph import (
+        load_graph_entities, load_graph_relations,
+    )
+
+    if not entity_name:
+        print(json.dumps({"error": "entity name required"}))
+        return
+
+    entities = load_graph_entities(memory_dir)
+    relations = load_graph_relations(memory_dir)
+
+    if entity_name not in entities:
+        # Try case-insensitive match
+        for name in entities:
+            if name.lower() == entity_name.lower():
+                entity_name = name
+                break
+        else:
+            print(json.dumps({
+                "error": f"Entity '{entity_name}' not found"
+            }))
+            return
+
+    # BFS: find all entities reachable via inbound relations
+    # (what depends ON this entity)
+    outbound = {}
+    inbound = {}
+    for r in relations:
+        fr = r.get("from", "")
+        to = r.get("to", "")
+        rt = r.get("relationType", "")
+        outbound.setdefault(fr, []).append((to, rt))
+        inbound.setdefault(to, []).append((fr, rt))
+
+    # Collect dependents (entities that point TO this one)
+    dependents = []
+    visited = {entity_name}
+    frontier = [entity_name]
+    for depth in range(max_depth):
+        next_frontier = []
+        for node in frontier:
+            for src, rt in inbound.get(node, []):
+                if src not in visited:
+                    visited.add(src)
+                    next_frontier.append(src)
+                    info = entities.get(src, {})
+                    dependents.append({
+                        "name": src,
+                        "type": info.get("entityType", ""),
+                        "relation": rt,
+                        "depth": depth + 1,
+                    })
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    # Collect dependencies (entities this one points TO)
+    dependencies = []
+    for to, rt in outbound.get(entity_name, []):
+        info = entities.get(to, {})
+        dependencies.append({
+            "name": to,
+            "type": info.get("entityType", ""),
+            "relation": rt,
+        })
+
+    # Find decisions that reference this entity
+    related_decisions = []
+    for name, info in entities.items():
+        if info.get("entityType") != "decision":
+            continue
+        # Check if any observation mentions the entity
+        for obs in info.get("observations", []):
+            if (isinstance(obs, str)
+                    and entity_name.lower() in obs.lower()):
+                display = name
+                if display.lower().startswith("decision: "):
+                    display = display[10:]
+                outcome = "pending"
+                for o in info.get("observations", []):
+                    if (isinstance(o, str)
+                            and o.startswith("Outcome: ")
+                            and not o.startswith(
+                                "Outcome: pending")):
+                        outcome = o[9:]
+                related_decisions.append({
+                    "name": display, "outcome": outcome
+                })
+                break
+    # Also check relation-connected decisions
+    for to, rt in outbound.get(entity_name, []):
+        info = entities.get(to, {})
+        if info.get("entityType") == "decision":
+            display = to
+            if display.lower().startswith("decision: "):
+                display = display[10:]
+            if not any(d["name"] == display
+                       for d in related_decisions):
+                related_decisions.append({
+                    "name": display, "outcome": "linked",
+                })
+    for src, rt in inbound.get(entity_name, []):
+        info = entities.get(src, {})
+        if info.get("entityType") == "decision":
+            display = src
+            if display.lower().startswith("decision: "):
+                display = display[10:]
+            if not any(d["name"] == display
+                       for d in related_decisions):
+                related_decisions.append({
+                    "name": display, "outcome": "linked",
+                })
+
+    # Entity's own info
+    info = entities[entity_name]
+
+    if sys.stdout.isatty():
+        etype = info.get("entityType", "")
+        tag = f" ({etype})" if etype else ""
+        n_obs = len(info.get("observations", []))
+        print(
+            f"\n\033[1mImpact: {entity_name}{tag}\033[0m"
+            f" ({n_obs} observations)\n"
+        )
+        if dependencies:
+            print(
+                f"  \033[36mDependencies "
+                f"({len(dependencies)}):\033[0m"
+            )
+            for d in dependencies:
+                tag = f" ({d['type']})" if d['type'] else ""
+                rel = f" [{d['relation']}]" if d['relation'] else ""
+                print(f"    -> {d['name']}{tag}{rel}")
+        if dependents:
+            print(
+                f"  \033[33mDependents "
+                f"({len(dependents)}):\033[0m"
+            )
+            for d in dependents[:15]:
+                tag = f" ({d['type']})" if d['type'] else ""
+                rel = f" [{d['relation']}]" if d['relation'] else ""
+                depth_s = f" (depth {d['depth']})" if d['depth'] > 1 else ""
+                print(
+                    f"    <- {d['name']}{tag}{rel}{depth_s}"
+                )
+            if len(dependents) > 15:
+                print(f"    +{len(dependents) - 15} more")
+        if related_decisions:
+            print(
+                f"  \033[35mDecisions "
+                f"({len(related_decisions)}):\033[0m"
+            )
+            for d in related_decisions:
+                print(
+                    f"    {d['name']} [{d['outcome']}]"
+                )
+        if not dependencies and not dependents and not related_decisions:
+            print("  No impact connections found.")
+        print()
+    else:
+        print(json.dumps({
+            "entity": entity_name,
+            "entityType": info.get("entityType", ""),
+            "dependencies": dependencies,
+            "dependents": dependents,
+            "related_decisions": related_decisions,
+        }, indent=2))
+
+
 def _run_viz(memory_dir, entity_name=None):
     """Output DOT graph for visualization."""
     from semantic_server.graph import (
@@ -1346,6 +1828,7 @@ def _parse_tool_args(tool_name, extra_args):
         "doctor", "rebuild_index",
         "viz", "timeline",
         "remember", "forget", "sync",
+        "diff", "context", "impact",
     }
     if tool_name in _POSITIONAL_TOOLS:
         return _parse_positional(extra_args)
@@ -1478,6 +1961,21 @@ def main():
     if tool_name == "timeline":
         global_mode = "--global" in extra_args
         _run_timeline(memory_dir, global_mode)
+        return
+
+    if tool_name == "diff":
+        _run_diff(memory_dir)
+        return
+
+    if tool_name == "context":
+        filepath = tool_args.get("query", "")
+        _run_context(memory_dir, filepath)
+        return
+
+    if tool_name == "impact":
+        entity = tool_args.get("query", "")
+        depth = tool_args.get("depth", 3)
+        _run_impact(memory_dir, entity, max_depth=depth)
         return
 
     # --- Commands that need semantic_server ---

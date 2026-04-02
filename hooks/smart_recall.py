@@ -8,6 +8,13 @@ Progressive disclosure tiers:
   Tier 1 (SessionStart default): status line + entity names/types (~50 tokens)
   Tier 2 (mem search --compact):  + scores + top observation (~200 tokens)
   Tier 3 (mem search / mem recall): full observations + relations (~1000 tokens)
+
+Intelligence features:
+  - Relevance gating: entities below MIN_SCORE are excluded
+  - Token budgeting: output capped at configurable token budget
+  - Stale decision nudge: pending decisions aged > threshold get flagged
+  - Configurable recall style: minimal | balanced | detailed
+  - Session diff: tracks last session timestamp for mem diff
 """
 import json
 import math
@@ -31,6 +38,38 @@ except ImportError:
 _MAIN_BRANCHES = frozenset({
     "main", "master", "trunk", "develop",
 })
+
+# --- Defaults (overridable via .memory/config.json) ---
+_MIN_SCORE = 0.05
+_TOKEN_BUDGET = 300
+_RECALL_STYLE = "balanced"  # minimal | balanced | detailed
+_STALE_DECISION_DAYS = 7
+
+
+def _load_recall_config(memory_dir):
+    """Load recall settings from .memory/config.json."""
+    config_path = os.path.join(memory_dir, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        global _MIN_SCORE, _TOKEN_BUDGET, _RECALL_STYLE
+        global _STALE_DECISION_DAYS
+        v = data.get("min_recall_score")
+        if isinstance(v, (int, float)) and 0 <= v <= 1:
+            _MIN_SCORE = v
+        v = data.get("recall_token_budget")
+        if isinstance(v, (int, float)) and 50 <= v <= 2000:
+            _TOKEN_BUDGET = int(v)
+        v = data.get("recall_style")
+        if v in ("minimal", "balanced", "detailed"):
+            _RECALL_STYLE = v
+        v = data.get("stale_decision_days")
+        if isinstance(v, (int, float)) and v >= 1:
+            _STALE_DECISION_DAYS = int(v)
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
 
 
 def _read_git_head(project_dir):
@@ -256,6 +295,11 @@ def _score_entity(info, now_ts, recall_counts, name,
     return score
 
 
+def _estimate_tokens(text):
+    """Rough token estimate: ~4 chars per token."""
+    return max(1, len(text) // 4)
+
+
 def _build_adjacency(relations):
     """Build bidirectional adjacency."""
     adj = defaultdict(list)
@@ -266,48 +310,115 @@ def _build_adjacency(relations):
 
 
 def _print_compact_entities(scored, adj):
-    """Tier 1: Compact entity names + types, one line.
+    """Tier 1: Compact entity names + types, budget-aware.
 
-    ~50 tokens total. Claude calls `mem search` for details.
+    Respects token budget and recall style.
     """
-    n_scored = len(scored)
-    if n_scored <= 20:
-        budget = min(10, n_scored)
-    elif n_scored <= 200:
-        budget = min(5, n_scored)
-    else:
-        budget = min(3, n_scored)
+    if not scored:
+        return
 
+    if _RECALL_STYLE == "minimal":
+        max_items = min(3, len(scored))
+    elif _RECALL_STYLE == "detailed":
+        max_items = min(15, len(scored))
+    else:  # balanced
+        n_scored = len(scored)
+        if n_scored <= 20:
+            max_items = min(10, n_scored)
+        elif n_scored <= 200:
+            max_items = min(5, n_scored)
+        else:
+            max_items = min(3, n_scored)
+
+    tokens_used = 0
     parts = []
-    for _, name, info in scored[:budget]:
+    for _, name, info in scored[:max_items]:
         etype = info.get("entityType", "")
         tag = f"({etype})" if etype else ""
-        # Count 1-hop connections
         n_conn = len(adj.get(name, []))
         conn = f" [{n_conn} conn]" if n_conn else ""
-        parts.append(f"{name}{tag}{conn}")
-    print("  Top: " + ", ".join(parts))
+        entry = f"{name}{tag}{conn}"
+        entry_tokens = _estimate_tokens(entry)
+        if tokens_used + entry_tokens > _TOKEN_BUDGET and parts:
+            break
+        parts.append(entry)
+        tokens_used += entry_tokens
+
+    if parts:
+        print("  Top: " + ", ".join(parts))
 
 
-def _print_pending_decisions(entities):
-    """Print decisions that are still in pending state."""
+def _print_pending_decisions(entities, now_ts):
+    """Print decisions that are still pending, with age."""
     pending = []
     for name, info in entities.items():
         if info.get("entityType") != "decision":
             continue
         obs = info.get("observations", [])
-        if not any(
+        is_pending = not any(
             o.startswith("Outcome: ") and not o.startswith("Outcome: pending")
             for o in obs if isinstance(o, str)
-        ):
-            display = name[10:] if name.lower().startswith("decision: ") else name
-            pending.append(display)
-    if pending:
-        print(f"  Pending decisions ({len(pending)}):")
-        for d in pending[:5]:
-            print(f"    - {d}")
-        if len(pending) > 5:
-            print(f"    +{len(pending) - 5} more")
+        )
+        if not is_pending:
+            continue
+        display = name[10:] if name.lower().startswith("decision: ") else name
+        updated = info.get("_updated") or info.get("_created", "")
+        days = _parse_iso_days_ago(updated, now_ts)
+        pending.append((days, display))
+
+    if not pending:
+        return
+
+    pending.sort(reverse=True)  # oldest first
+    stale = [p for p in pending if p[0] >= _STALE_DECISION_DAYS]
+    fresh = [p for p in pending if p[0] < _STALE_DECISION_DAYS]
+
+    if stale:
+        print(f"  Stale decisions ({len(stale)}, >{_STALE_DECISION_DAYS}d):")
+        for days, d in stale[:5]:
+            print(f"    ! {d} ({days}d ago)")
+        if len(stale) > 5:
+            print(f"    +{len(stale) - 5} more")
+    if fresh:
+        print(f"  Pending decisions ({len(fresh)}):")
+        for days, d in fresh[:3]:
+            age = f" ({days}d)" if days > 0 else ""
+            print(f"    - {d}{age}")
+        if len(fresh) > 3:
+            print(f"    +{len(fresh) - 3} more")
+
+
+def _stamp_session_start(memory_dir):
+    """Write current timestamp to .last-session-start for mem diff."""
+    marker = os.path.join(memory_dir, ".last-session-start")
+    try:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(marker, "w") as f:
+            f.write(ts)
+    except OSError:
+        pass
+
+
+def _count_changes_since_last_session(entities, memory_dir):
+    """Count entities added/updated since last session."""
+    marker = os.path.join(memory_dir, ".last-session-start")
+    try:
+        with open(marker) as f:
+            last_ts = f.read().strip()
+    except OSError:
+        return 0, 0
+    if not last_ts:
+        return 0, 0
+    new_count = 0
+    updated_count = 0
+    for info in entities.values():
+        created = info.get("_created", "")
+        updated = info.get("_updated", "")
+        if created and created > last_ts:
+            new_count += 1
+        elif updated and updated > last_ts:
+            updated_count += 1
+    return new_count, updated_count
 
 
 def main():
@@ -320,7 +431,19 @@ def main():
     project_dir = os.path.dirname(memory_dir)
     current_branch = _read_git_head(project_dir) or ""
 
+    # Load config overrides
+    _load_recall_config(memory_dir)
+
+    # Check for changes since last session before stamping
     entities, relations = _load_graph(memory_dir)
+
+    new_count, updated_count = _count_changes_since_last_session(
+        entities, memory_dir
+    )
+
+    # Stamp session start for next diff
+    _stamp_session_start(memory_dir)
+
     if not entities:
         if relations:
             print("Memory graph has relations but no entities.")
@@ -343,7 +466,8 @@ def main():
             info, now_ts, recall_counts, name,
             current_branch, active_files,
         )
-        if score > 0:
+        # Relevance gating: skip low-score entities
+        if score > _MIN_SCORE:
             scored.append((score, name, info))
 
     scored.sort(reverse=True)
@@ -363,16 +487,35 @@ def main():
         )
         native_str = f" | Native: {n_native} ({type_parts})"
 
-    # Tier 1: Compact status line (~50 tokens total)
+    # Session diff summary
+    diff_str = ""
+    if new_count or updated_count:
+        parts = []
+        if new_count:
+            parts.append(f"+{new_count} new")
+        if updated_count:
+            parts.append(f"~{updated_count} updated")
+        diff_str = f" | Since last: {', '.join(parts)}"
+
+    # Tier 1: Compact status line
     print(
         f"Memory: {n_ent}e {n_rel}r "
         f"{n_dec}d {n_warn}w"
         + native_str
         + (f" | branch:{current_branch}"
            if current_branch else "")
+        + diff_str
     )
+
+    relevant = len(scored)
+    if relevant < n_ent - type_counts.get("activity-log", 0):
+        gated = (n_ent - type_counts.get("activity-log", 0)
+                 - relevant)
+        if gated > 0 and _RECALL_STYLE != "minimal":
+            print(f"  ({gated} low-relevance entities filtered)")
+
     _print_compact_entities(scored, adj)
-    _print_pending_decisions(entities)
+    _print_pending_decisions(entities, now_ts)
     print(
         "Use `mem search <query>` or "
         "`mem recall <query>` for details."

@@ -34,6 +34,20 @@ from .graph import (
 _DECISION_PREFIX = "decision: "
 
 
+def _find_similar_entity(name, existing_entities):
+    """Check for existing entity with similar normalized name."""
+    from .text import normalize_name
+    norm = normalize_name(name)
+    if not norm or len(norm) < 3:
+        return None
+    for existing_name in existing_entities:
+        if existing_name == name:
+            continue
+        if normalize_name(existing_name) == norm:
+            return existing_name
+    return None
+
+
 def create_entities(entities_input, memory_dir):
     """Create entities via append-only write."""
     if not isinstance(entities_input, list):
@@ -87,6 +101,20 @@ def create_entities(entities_input, memory_dir):
             "message": "No valid entities",
         }
 
+    # Fuzzy match: warn about similar existing entities
+    existing = load_graph_entities(memory_dir)
+    similar_warnings = []
+    for entry in new_entries:
+        name = entry["name"]
+        if name in existing:
+            continue
+        similar = _find_similar_entity(name, existing)
+        if similar:
+            similar_warnings.append(
+                f"'{name}' similar to existing "
+                f"'{similar}'"
+            )
+
     if not append_jsonl(memory_dir, new_entries):
         return {
             "error": "Write failed (lock timeout)",
@@ -100,7 +128,14 @@ def create_entities(entities_input, memory_dir):
         "CREATE",
         f"{len(new_entries)} entities: {names}",
     )
-    return {"created": len(new_entries)}
+    result = {"created": len(new_entries)}
+    if similar_warnings:
+        result["similar_entities"] = similar_warnings
+        result["hint"] = (
+            "Consider using existing entity names "
+            "or renaming to avoid duplicates"
+        )
+    return result
 
 
 def create_relations(relations_input, memory_dir):
