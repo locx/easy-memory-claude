@@ -782,6 +782,11 @@ def main():
             )
             sys.exit(1)
 
+    # Init branch detection (project_dir = parent of .memory)
+    from semantic_server.config import init_branch
+    project_dir = os.path.dirname(memory_dir)
+    init_branch(project_dir)
+
     # Merge pending sidecar before any reads
     _merge_pending(memory_dir)
 

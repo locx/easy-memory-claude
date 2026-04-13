@@ -139,7 +139,7 @@ def _handle_entity_entry(entities, obj):
         if len(obs_list) > MAX_CACHED_OBS:
             obs_list = obs_list[-MAX_CACHED_OBS:]
         info = {
-            "entityType": obj.get("entityType", ""),
+            "entityType": obj.get("entityType", "").lower(),
             "observations": obs_list,
             "_created": _norm_ts(obj.get("_created", "")),
             "_updated": _norm_ts(obj.get("_updated", "")),

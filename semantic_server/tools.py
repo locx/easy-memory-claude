@@ -77,6 +77,7 @@ def create_entities(entities_input, memory_dir):
         etype = ent.get("entityType", "")
         if not isinstance(etype, str):
             etype = str(etype)
+        etype = etype.lower()
         obs = ent.get("observations", [])
         if not isinstance(obs, list):
             obs = [str(obs)]
