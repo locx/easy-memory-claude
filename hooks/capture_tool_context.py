@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: capture observations + surface warnings.
+"""PostToolUse hook: surface file warnings from the knowledge graph.
 
 Usage: python3 capture_tool_context.py <input_json> <graph_path>
 """
@@ -8,7 +8,6 @@ import os
 import sys
 import time
 
-_MAX_PENDING_BYTES = 1_000_000
 _WARN_SCAN_LINE_BUDGET = 5_000
 
 
@@ -137,126 +136,20 @@ def main():
         sys.exit(1)
 
     tool = data.get('tool_name', '')
-    if tool not in ('Edit', 'Write', 'Bash', 'NotebookEdit'):
-        sys.exit(2)
+    if tool not in ('Edit', 'Write'):
+        sys.exit(0)
 
-    # File warnings (Edit/Write only)
-    file_path = None
-    if tool in ('Edit', 'Write'):
-        file_path = data.get('tool_input', {}).get(
-            'file_path', '?'
-        )
-        session_id = os.environ.get(
-            'CLAUDE_SESSION_ID', 'unknown'
-        )
-        warning_text = _check_file_warnings(
-            graph_path, file_path, session_id
-        )
-        if warning_text:
-            print(warning_text)
-
-    # Activity logging
-    if tool in ('Edit', 'Write'):
-        base = os.path.basename(file_path or '?')
-        verb = 'Edited' if tool == 'Edit' \
-            else 'Created/wrote'
-        obs = f'{verb} {base}'
-    elif tool == 'Bash':
-        cmd = str(
-            data.get('tool_input', {}).get('command', '')
-        )[:80]
-        obs = f'Ran: {cmd}'
-    else:
-        obs = f'{tool} used'
-
-    ts = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    observation = f'[{ts}] {obs}'
-
-    entry = json.dumps({
-        'type': 'entity',
-        'name': 'session-activity',
-        'entityType': 'activity-log',
-        'observations': [observation],
-        '_created': ts,
-        '_updated': ts,
-    }, separators=(',', ':'))
-
-    pending_path = graph_path + ".pending"
-    try:
-        if os.path.getsize(pending_path) \
-                >= _MAX_PENDING_BYTES:
-            print(
-                "Warning: pending sidecar full, "
-                "observation skipped",
-                file=sys.stderr,
-            )
-            return
-    except OSError:
-        pass
-    try:
-        with open(pending_path, 'a', encoding="utf-8") as f:
-            f.write(entry + '\n')
-            f.flush()
-    except OSError:
-        if not _write_direct(graph_path, entry):
-            print(
-                "Warning: observation lost — both sidecar "
-                "and direct write failed",
-                file=sys.stderr,
-            )
-
-
-def _write_direct(graph_path, entry):
-    """Fallback: locked append to graph.jsonl."""
-    try:
-        import fcntl
-    except ImportError:
-        fcntl = None
-    lock_path = os.path.join(
-        os.path.dirname(graph_path), '.graph.lock'
+    file_path = data.get('tool_input', {}).get(
+        'file_path', '?'
     )
-    acquired = False
-    lock_fd = None
-    if fcntl is not None:
-        try:
-            lock_fd = open(lock_path, 'a')
-            delay = 0.025
-            for _ in range(5):
-                try:
-                    fcntl.flock(
-                        lock_fd,
-                        fcntl.LOCK_EX | fcntl.LOCK_NB,
-                    )
-                    acquired = True
-                    break
-                except (IOError, OSError):
-                    time.sleep(delay)
-                    delay *= 2
-            if not acquired:
-                lock_fd.close()
-                lock_fd = None
-                return False
-        except OSError:
-            if lock_fd is not None:
-                lock_fd.close()
-            return False
-    try:
-        with open(
-            graph_path, 'a', encoding="utf-8"
-        ) as f:
-            f.write(entry + '\n')
-            f.flush()
-            os.fsync(f.fileno())
-        return True
-    except OSError:
-        return False
-    finally:
-        if acquired and fcntl is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                lock_fd.close()
-            except OSError:
-                pass
+    session_id = os.environ.get(
+        'CLAUDE_SESSION_ID', 'unknown'
+    )
+    warning_text = _check_file_warnings(
+        graph_path, file_path, session_id
+    )
+    if warning_text:
+        print(warning_text)
 
 
 if __name__ == '__main__':

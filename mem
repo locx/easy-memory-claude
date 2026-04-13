@@ -1,27 +1,24 @@
 #!/bin/bash
-# mem — short wrapper for easy-memory-claude CLI.
+# mem — CLI for the knowledge graph memory system.
 # Resolves MEMORY_DIR from git root or upwards automatically.
 # Usage:
-#   mem search auth                  # Search both graph + native memory
+#   mem search auth                  # Search graph
 #   mem search auth --top-k 5        # Limit results
 #   mem recall auth                  # Search + 1-hop graph neighbors
 #   mem write '{"entities":[...]}'   # Create graph entities/relations
 #   mem decide '{"title":"..."}'     # Decision journal
-#   mem remember "text"              # Write to native auto-memory
-#   mem remember --type feedback "x" # With explicit type
-#   mem forget "name"                # Remove native memory
-#   mem sync                         # Sync native -> graph
 #   mem remove '{"entity_names":[]}' # Delete graph entities
-#   mem status                       # Health of both systems
-#   mem doctor                       # Diagnostics across both stores
+#   mem status                       # Graph health
+#   mem doctor                       # Diagnostics
 #   mem rebuild                      # Rebuild TF-IDF index
+#   mem diff                         # Changes since last session
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 find_root() {
     local d="$PWD"
-    
+
     # 1. Look for existing .memory upwards
     while [ "$d" != "/" ] && [ -n "$d" ]; do
         if [ -d "$d/.memory" ]; then
@@ -35,7 +32,7 @@ find_root() {
     if git rev-parse --show-toplevel 2>/dev/null; then
         return
     fi
-    
+
     # 3. Look for common project markers upwards
     d="$PWD"
     while [ "$d" != "/" ] && [ -n "$d" ]; do
@@ -45,7 +42,7 @@ find_root() {
         fi
         d="$(dirname "$d")"
     done
-    
+
     # 4. Fallback to current directory
     echo "$PWD"
 }

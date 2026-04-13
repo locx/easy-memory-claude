@@ -32,12 +32,6 @@ MAX_OBS_LENGTH = 5000
 MAX_GRAPH_BYTES = 50_000_000
 MAX_CACHED_OBS = 20
 
-# Recall intelligence
-MIN_RECALL_SCORE = 0.05
-RECALL_TOKEN_BUDGET = 300
-RECALL_STYLE_DEFAULT = "balanced"  # minimal | balanced | detailed
-STALE_DECISION_DAYS = 7
-
 RE_WORDS = re.compile(r'\w+')
 
 

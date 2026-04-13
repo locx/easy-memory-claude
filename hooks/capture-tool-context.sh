@@ -51,15 +51,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || exit 1
 python3 "${SCRIPT_DIR}/capture_tool_context.py" "$TMPINPUT" "$GRAPH"
 PY_EXIT=$?
 
-# Update throttle marker only after successful capture
+# Update throttle marker after successful run
 if [ "$PY_EXIT" -eq 0 ]; then
     touch "$MARKER"
 fi
 
-# Exit 2 = non-matching tool (expected), treat as success
-# Exit 0 = captured successfully
-# Other = real failure, propagate
-if [ "$PY_EXIT" -eq 0 ] || [ "$PY_EXIT" -eq 2 ]; then
-    exit 0
-fi
 exit "$PY_EXIT"

@@ -232,89 +232,79 @@ if [ -s "${GRAPH_FILE}" ]; then
     fi
 fi
 
-# ---- 9. Add/update memory plugin instructions in CLAUDE.md ----
+# ---- 9. Add Bash permission for mem commands in .claude/settings.json ----
+PROJ_SETTINGS_DIR="${PROJECT_DIR}/.claude"
+PROJ_SETTINGS="${PROJ_SETTINGS_DIR}/settings.json"
+MEM_PERM="Bash(\$HOME/.claude/memory/mem *)"
+
+mkdir -p "${PROJ_SETTINGS_DIR}"
+python3 - "${PROJ_SETTINGS}" "${MEM_PERM}" << 'PYEOF'
+import json, os, sys
+
+settings_path = sys.argv[1]
+perm = sys.argv[2]
+
+try:
+    with open(settings_path, encoding='utf-8') as f:
+        cfg = json.load(f)
+except (OSError, json.JSONDecodeError, ValueError):
+    cfg = {}
+
+perms = cfg.setdefault('permissions', {})
+allow = perms.setdefault('allow', [])
+
+if perm in allow:
+    print(f'  [skip] mem Bash permission already in {settings_path}')
+    sys.exit(0)
+
+allow.append(perm)
+
+tmp = settings_path + '.tmp'
+with open(tmp, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(tmp, settings_path)
+print(f'  [ok] Added mem Bash permission to {settings_path}')
+PYEOF
+
+# ---- 10. Add/update memory plugin instructions in CLAUDE.md ----
 CLAUDE_MD="${PROJECT_DIR}/CLAUDE.md"
 MEMORY_MARKER="## Memory Graph"
 
-MEMORY_SECTION='
-## Memory Graph
+MEMORY_SECTION='## Memory Graph
 
-Unified memory gateway via `mem`. Two stores, one interface:
+Knowledge graph in `.memory/` — entities, relations, decisions. Searchable via TF-IDF, branch-aware, with decay. A SessionStart hook prints a compact status line automatically (~50 tokens).
 
-- **Knowledge graph** (`.memory/`): Entities, relations, decisions — searchable, scored, branch-aware
-- **Native memory** (`~/.claude/projects/.../memory/`): User prefs, feedback, references — always loaded in context
+All commands use `$HOME/.claude/memory/mem`:
 
-All commands:
+### Read
 
-    mem <command> [args]
+- `$HOME/.claude/memory/mem search <query>` — find entities by topic (use before writing to avoid duplicates)
+- `$HOME/.claude/memory/mem recall <query>` — search + 1-hop graph neighbors (use to understand connections)
+- `$HOME/.claude/memory/mem diff` — what changed since last session
+- `$HOME/.claude/memory/mem status` — graph health + pending decision nudge
 
-### Reading Memory
+### Write
 
-SessionStart automatically prints a compact status line. Use these commands **on demand** when you need details:
+- `$HOME/.claude/memory/mem write '\''{"entities":[{"name":"AuthService","entityType":"service","observations":["Handles JWT tokens"]}]}'\''`
+- `$HOME/.claude/memory/mem write '\''{"relations":[{"from":"AuthService","to":"UserDB","relationType":"depends-on"}]}'\''`
+- `$HOME/.claude/memory/mem decide '\''{"title":"Use Postgres over Mongo","rationale":"need multi-doc txns","alternatives":["MongoDB -- no txns"]}'\''`
+- `$HOME/.claude/memory/mem remove '\''{"entity_names":["OldService"]}'\''`
 
-| Command | When to use | What it returns |
-|---------|-------------|-----------------|
-| `mem search <query>` | Need context on a topic | Results from both graph + native memory |
-| `mem recall <query>` | Need context + relationships | Search + 1-hop graph neighbors |
-| `mem status` | Check health of both systems | Graph stats + native counts + decision nudge |
-| `mem doctor` | Diagnose issues | Health checks across both stores |
-| `mem rebuild` | Force index refresh | Re-scans and updates TF-IDF index |
+### Maintain
 
-**search vs recall**: Use `search` for facts. Use `recall` to understand how things connect (e.g. "what depends on AuthService?").
-
-### Writing Memory
-
-Fire autonomously — no permission needed.
-
-| What to store | Command | Example |
-|---------------|---------|---------|
-| User prefs, feedback, role | `mem remember` | `mem remember --type feedback "Don'\''t mock the DB"` |
-| Project decisions, rationale | `mem decide` | `mem decide '\''{"title":"Postgres","chosen":"PG"}'\''` |
-| Code entities, architecture | `mem write` | `mem write '\''{"entities":[{"name":"Svc","observations":["..."]}]}'\''` |
-| Entity relationships | `mem write` | `mem write '\''{"relations":[{"from":"A","to":"B"}]}'\''` |
-| Quick references | `mem remember` | `mem remember --type reference --name "api-docs" "See confluence/api"` |
-| Remove native memory | `mem forget` | `mem forget "memory-name"` |
-| Remove graph entities | `mem remove` | `mem remove '\''{"entity_names":["Old"]}'\''` |
-| Sync both stores | `mem sync` | `mem sync` |
-
-### Memory Routing
-
-**Native memory** (via `mem remember`) loads automatically every session at zero token cost. Use for:
-- Your role, expertise, preferences (`--type user`)
-- Corrections and workflow feedback (`--type feedback`)
-- External references, links (`--type reference`)
-
-**Knowledge graph** (via `mem write`/`mem decide`) requires `mem search` to query but supports relations, scoring, and decay. Use for:
-- Architectural decisions and their rationale
-- Code component relationships
-- File warnings and known issues
-- Facts that benefit from graph traversal
-
-> **Rule:** Major task + >=1 architectural choice + no `mem decide` = incomplete.
-
-### How SessionStart Works
-
-At session start a hook prints a compact status like:
-
-    Memory: 42e 28r 3d 0w | Native: 3 (1 user, 1 feedback, 1 project) | branch:main
-      Top: SyncManager(component) [1 conn], AuthService(service) [2 conn]
-
-This is ~50 tokens. Call `mem search` or `mem recall` only when you need deeper context.
-
-### Aliases
-
-Project-specific synonyms in `.memory/aliases.json` improve search. Format:
-
-```json
-{"groups": [["cache", "memoize", "memoization"], ["api", "endpoint", "route"]]}
-```
+- `$HOME/.claude/memory/mem doctor` — deep health check (orphan relations, stale decisions, index age)
+- `$HOME/.claude/memory/mem rebuild` — force TF-IDF index refresh
 
 ### Rules
 
-- **Always search before writing:** Run `mem search` before creating entities to avoid duplicates.
-- **Pending decisions:** If SessionStart shows pending decisions relevant to your task, resolve them with `mem decide` before starting new work.
-- **Use the right store:** Native memory for personal context (always loaded). Graph for project knowledge (searchable, relational).
-- **`mem` is the gateway:** All memory operations go through `mem` commands. Do not write to native memory files or graph.jsonl directly.'
+1. **Search before write.** Run `$HOME/.claude/memory/mem search` before creating entities to avoid duplicates.
+2. **Decisions are mandatory.** Major task + architectural choice + no `$HOME/.claude/memory/mem decide` = incomplete.
+3. **Resolve stale decisions.** If SessionStart shows pending decisions, resolve with `$HOME/.claude/memory/mem decide '\''{"action":"resolve","title":"...","outcome":"successful","lesson":"..."}'\''`.
+4. **Do not edit `.memory/` files directly.** Always use `$HOME/.claude/memory/mem` commands.
+5. **Aliases** in `.memory/aliases.json` improve search: `{"groups": [["cache", "memoize"], ["api", "endpoint"]]}`'
 
 if [ ! -f "${CLAUDE_MD}" ]; then
     echo "  [skip] No CLAUDE.md found — memory instructions not added"
@@ -367,6 +357,6 @@ echo "  Graph:    ${GRAPH_FILE}"
 echo "  Access:   CLI bridge (Bash) — works in both CLI and VSCode"
 echo ""
 echo "  Commands:"
-echo "    search, recall, write, decide, remember,"
-echo "    forget, sync, remove, status, doctor, rebuild"
+echo "    search, recall, write, decide, remove,"
+echo "    status, doctor, rebuild, diff"
 echo "============================================================"

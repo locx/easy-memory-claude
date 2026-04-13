@@ -133,46 +133,6 @@ def _read_recall_counts(memory_dir):
         return {}
 
 
-def _count_native_memories(project_dir):
-    """Count native auto-memory files by type.
-
-    SYNC NOTE: Path derivation duplicated in memory-cli.py
-    (_resolve_native_memory_dir). Keep both in sync.
-    """
-    key = project_dir.lstrip("/").replace("/", "-")
-    native_dir = os.path.join(
-        os.path.expanduser("~"), ".claude", "projects",
-        f"-{key}", "memory",
-    )
-    if not os.path.isdir(native_dir):
-        return 0, {}
-    counts = {}
-    total = 0
-    for fname in os.listdir(native_dir):
-        if not fname.endswith('.md') or fname == 'MEMORY.md':
-            continue
-        fpath = os.path.join(native_dir, fname)
-        mem_type = "unknown"
-        try:
-            with open(fpath, encoding='utf-8') as f:
-                in_fm = False
-                for line in f:
-                    stripped = line.strip()
-                    if stripped == '---':
-                        if in_fm:
-                            break
-                        in_fm = True
-                        continue
-                    if in_fm and stripped.startswith('type:'):
-                        mem_type = stripped.split(':', 1)[1].strip()
-                        break
-        except OSError:
-            continue
-        counts[mem_type] = counts.get(mem_type, 0) + 1
-        total += 1
-    return total, counts
-
-
 _MAX_ENTITY_COUNT = 100_000
 _MAX_LINE_LEN = 10_000_000
 _PARSE_TIME_BUDGET = 10.0
@@ -460,13 +420,10 @@ def main():
     for name, info in entities.items():
         etype = info.get("entityType", "unknown")
         type_counts[etype] += 1
-        if etype == "activity-log":
-            continue
         score = _score_entity(
             info, now_ts, recall_counts, name,
             current_branch, active_files,
         )
-        # Relevance gating: skip low-score entities
         if score > _MIN_SCORE:
             scored.append((score, name, info))
 
@@ -477,15 +434,6 @@ def main():
     n_rel = len(relations)
     n_dec = type_counts.get("decision", 0)
     n_warn = type_counts.get("file-warning", 0)
-
-    # Native memory count
-    n_native, native_types = _count_native_memories(project_dir)
-    native_str = ""
-    if n_native:
-        type_parts = ", ".join(
-            f"{c} {t}" for t, c in native_types.items()
-        )
-        native_str = f" | Native: {n_native} ({type_parts})"
 
     # Session diff summary
     diff_str = ""
@@ -501,24 +449,22 @@ def main():
     print(
         f"Memory: {n_ent}e {n_rel}r "
         f"{n_dec}d {n_warn}w"
-        + native_str
         + (f" | branch:{current_branch}"
            if current_branch else "")
         + diff_str
     )
 
     relevant = len(scored)
-    if relevant < n_ent - type_counts.get("activity-log", 0):
-        gated = (n_ent - type_counts.get("activity-log", 0)
-                 - relevant)
+    if relevant < n_ent:
+        gated = n_ent - relevant
         if gated > 0 and _RECALL_STYLE != "minimal":
             print(f"  ({gated} low-relevance entities filtered)")
 
     _print_compact_entities(scored, adj)
     _print_pending_decisions(entities, now_ts)
     print(
-        "Use `mem search <query>` or "
-        "`mem recall <query>` for details."
+        f"Use `{os.path.expanduser('~')}/.claude/memory/mem search <query>` or "
+        f"`{os.path.expanduser('~')}/.claude/memory/mem recall <query>` for details."
     )
 
 

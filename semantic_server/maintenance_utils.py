@@ -208,7 +208,7 @@ def consolidate(entities, relations, min_merge_name_len=4):
     # Cap observations
     for e in kept:
         obs = e.get("observations", [])
-        cap = 50 if e.get("entityType") == "activity-log" else 200
+        cap = 200
         if len(obs) > cap:
             e["observations"] = obs[-cap:]
 

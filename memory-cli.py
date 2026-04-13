@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
-"""CLI bridge for memory tools — unified gateway.
+"""CLI for the knowledge graph memory system.
 
-Usage: python3 memory-cli.py [--memory-dir DIR] <tool> [json_args]
+Usage: python3 memory-cli.py [--memory-dir DIR] <command> [args]
 
-Gateway for both knowledge graph (.memory/) and Claude Code's
-native auto-memory (~/.claude/projects/.../memory/).
+Commands: search, recall, write, decide, remove, status, doctor,
+          rebuild, diff.
 """
 import json
 import os
-import re
 import sys
-
-try:
-    import fcntl
-    _HAS_FLOCK = True
-except ImportError:
-    _HAS_FLOCK = False
+import time
 
 # Add script's own directory to path
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -45,228 +39,40 @@ def _resolve_memory_dir(argv):
     return md, cleaned
 
 
-def _resolve_native_memory_dir(memory_dir=None):
-    """Derive Claude Code's native auto-memory directory from project path.
-
-    Path format: ~/.claude/projects/-<path-with-slashes-as-dashes>/memory/
-    Example: /Users/foo/projects/bar -> ~/.claude/projects/-Users-foo-projects-bar/memory/
-
-    SYNC NOTE: This derivation is duplicated in hooks/smart_recall.py
-    (_count_native_memories). Keep both in sync if the path scheme changes.
-    """
-    if memory_dir:
-        project_dir = os.path.dirname(os.path.abspath(memory_dir))
-    else:
-        project_dir = os.getcwd()
-    key = project_dir.lstrip("/").replace("/", "-")
-    return os.path.join(
-        os.path.expanduser("~"), ".claude", "projects",
-        f"-{key}", "memory",
-    )
-
-
-def _parse_frontmatter(content):
-    """Parse YAML frontmatter from markdown content."""
-    fm = {}
-    body = content
-    m = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
-    if m:
-        body = content[m.end():]
-        for line in m.group(1).splitlines():
-            k, _, v = line.partition(':')
-            k, v = k.strip(), v.strip()
-            if k and v:
-                fm[k] = v
-    return fm, body
-
-
-def _search_native_memories(query, native_dir):
-    """Keyword search across native auto-memory .md files."""
-    if not os.path.isdir(native_dir):
-        return []
-    results = []
-    query_terms = set(query.lower().split())
-    if not query_terms:
-        return []
-    for fname in os.listdir(native_dir):
-        if not fname.endswith('.md') or fname == 'MEMORY.md':
-            continue
-        fpath = os.path.join(native_dir, fname)
-        try:
-            with open(fpath, encoding='utf-8') as f:
-                content = f.read()
-        except OSError:
-            continue
-        fm, body = _parse_frontmatter(content)
-        text = ' '.join([
-            fm.get('name', ''), fm.get('description', ''), body,
-        ]).lower()
-        hits = sum(1 for t in query_terms if t in text)
-        if hits > 0:
-            results.append({
-                "entity": fm.get('name', os.path.splitext(fname)[0]),
-                "entityType": f"native:{fm.get('type', 'unknown')}",
-                "score": round(hits / len(query_terms), 2),
-                "observations": (
-                    [fm.get('description', '')]
-                    if fm.get('description') else []
-                ),
-                "source": "native",
-                "file": fname,
-            })
-    results.sort(key=lambda r: r['score'], reverse=True)
-    return results
-
-
-def _get_native_memory_stats(native_dir):
-    """Count native auto-memory files by type."""
-    if not os.path.isdir(native_dir):
-        return None
-    counts = {}
-    total = 0
-    for fname in os.listdir(native_dir):
-        if not fname.endswith('.md') or fname == 'MEMORY.md':
-            continue
-        fpath = os.path.join(native_dir, fname)
-        try:
-            with open(fpath, encoding='utf-8') as f:
-                content = f.read(500)
-        except OSError:
-            continue
-        fm, _ = _parse_frontmatter(content)
-        mem_type = fm.get('type', 'unknown')
-        counts[mem_type] = counts.get(mem_type, 0) + 1
-        total += 1
-    return {"total": total, "by_type": counts} if total else None
-
-
-def _update_memory_index(native_dir, filename, name, description):
-    """Add or update entry in MEMORY.md index."""
-    index_path = os.path.join(native_dir, "MEMORY.md")
-    lines = []
-    if os.path.isfile(index_path):
-        with open(index_path, encoding='utf-8') as f:
-            lines = f.readlines()
-    entry_line = f"- [{name}]({filename}) — {description}\n"
-    found = False
-    for i, line in enumerate(lines):
-        if f"]({filename})" in line:
-            lines[i] = entry_line
-            found = True
-            break
-    if not found:
-        if not lines:
-            lines = ["# Memory Index\n", "\n"]
-        lines.append(entry_line)
-    tmp = index_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, index_path)
-
-
-def _rebuild_memory_index(native_dir):
-    """Rebuild MEMORY.md from all .md files in native dir."""
-    index_path = os.path.join(native_dir, "MEMORY.md")
-    lines = ["# Memory Index\n", "\n"]
-    for fname in sorted(os.listdir(native_dir)):
-        if not fname.endswith('.md') or fname == 'MEMORY.md':
-            continue
-        fpath = os.path.join(native_dir, fname)
-        try:
-            with open(fpath, encoding='utf-8') as f:
-                content = f.read(500)
-        except OSError:
-            continue
-        fm, _ = _parse_frontmatter(content)
-        name = fm.get('name', os.path.splitext(fname)[0])
-        desc = fm.get('description', '')
-        lines.append(f"- [{name}]({fname}) — {desc}\n")
-    tmp = index_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, index_path)
-
-
-def _flock_native(native_dir):
-    """Acquire exclusive lock on native memory directory.
-
-    Returns (lock_fd, lock_path) or (None, None) if flock unavailable.
-    Caller must call _funlock_native(lock_fd) when done.
-    """
-    if not _HAS_FLOCK:
-        return None, None
-    lock_path = os.path.join(native_dir, ".memory.lock")
-    lock_fd = open(lock_path, "w")
-    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    return lock_fd, lock_path
-
-
-def _funlock_native(lock_fd):
-    """Release native memory directory lock."""
-    if lock_fd:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
-        except OSError:
-            pass
-
-
 def _usage():
     print(
         "Usage: mem [--memory-dir DIR] "
         "<command> [args]\n"
-        "\nUnified Commands:\n"
+        "\nCommands:\n"
         "  search <query>          "
-        "Search both graph + native memory\n"
+        "Search knowledge graph\n"
         "  recall <query>          "
         "Search + 1-hop graph neighbors\n"
         "  write  '<json>'         "
         "Create graph entities/relations/obs\n"
         "  decide '<json>'         "
         "Create or resolve a decision\n"
-        "  remember '<text>'       "
-        "Write to native auto-memory\n"
-        "  forget  '<name>'        "
-        "Remove from native auto-memory\n"
-        "  sync                    "
-        "Sync native memory into graph\n"
         "  remove '<json>'         "
         "Delete graph entities/observations\n"
         "  status                  "
-        "Health of both memory systems\n"
+        "Graph health + diagnostics\n"
         "  doctor                  "
-        "Diagnostics across both stores\n"
+        "Deep health check\n"
         "  rebuild                 "
         "Rebuild TF-IDF index\n"
-        "  viz [entity]            "
-        "Graph visualization (DOT format)\n"
-        "  timeline [--global]     "
-        "Recent activity across projects\n"
         "  diff                    "
-        "Changes since last session\n"
-        "  context <filepath>      "
-        "File-specific entity recall\n"
-        "  impact <entity>         "
-        "Impact analysis via graph traversal\n"
-        "\nLegacy tool names also work for "
-        "backward compatibility.",
+        "Changes since last session",
         file=sys.stderr,
     )
     sys.exit(1)
 
 
 def _parse_positional(args):
-    """Parse positional args for unified tools.
+    """Parse positional args into a tool_args dict.
 
     Supports flags before or after positional values:
       search auth service     -> {"query": "auth service"}
       search auth --compact   -> {"query": "auth", "compact": true}
-      remember --type feedback "text" -> {"entity_type": "feedback", "query": "text"}
-      status                  -> {}
     Falls back to JSON parsing for complex args.
     """
     if not args:
@@ -300,11 +106,6 @@ def _parse_positional(args):
         elif arg == "--type" and i + 1 < len(args):
             i += 1
             result["entity_type"] = args[i]
-        elif arg == "--name" and i + 1 < len(args):
-            i += 1
-            result["name"] = args[i]
-        elif arg == "--global":
-            result["global"] = True
         elif arg == "--depth" and i + 1 < len(args):
             i += 1
             try:
@@ -319,26 +120,24 @@ def _parse_positional(args):
     return result
 
 
-def _do_merge(merging, graph):
-    """Read merging file, append to graph, delete merging.
+# --- Pending sidecar merge ---
 
-    If append succeeds but unlink fails, truncate the
-    file to prevent re-appending the same data.
-    """
+def _do_merge(merging, graph):
+    """Read merging file, append to graph, delete merging."""
     try:
-        if (os.path.exists(merging)
-                and os.path.getsize(merging) > 50 * 1024 * 1024):
-            sys.stderr.write(
-                f"Error: Pending merge file {merging} "
-                f"exceeds 50MB limit. Skipping.\n"
-            )
-            try:
-                os.unlink(merging)
-            except OSError:
-                pass
-            return
+        size = os.path.getsize(merging)
     except OSError:
-        pass
+        return
+    if size > 50 * 1024 * 1024:
+        sys.stderr.write(
+            f"Error: Pending merge file {merging} "
+            f"exceeds 50MB limit. Skipping.\n"
+        )
+        try:
+            os.unlink(merging)
+        except OSError:
+            pass
+        return
 
     try:
         with open(merging, "rb") as src:
@@ -368,8 +167,7 @@ def _merge_pending(memory_dir):
     """Merge .pending sidecar into graph.jsonl.
 
     Atomic rename prevents TOCTOU with concurrent hook
-    writers — new writes go to a fresh .pending file.
-    Recovers orphaned .merging/.processing from crash.
+    writers. Recovers orphaned .merging from crash.
     """
     pending = os.path.join(
         memory_dir, "graph.jsonl.pending"
@@ -377,8 +175,7 @@ def _merge_pending(memory_dir):
     merging = pending + ".merging"
     graph = os.path.join(memory_dir, "graph.jsonl")
 
-    if os.path.exists(merging):
-        _do_merge(merging, graph)
+    _do_merge(merging, graph)
 
     try:
         os.rename(pending, merging)
@@ -386,6 +183,8 @@ def _merge_pending(memory_dir):
         return
     _do_merge(merging, graph)
 
+
+# --- Doctor ---
 
 def _load_graph_doctor(graph_path, issues):
     entities = {}
@@ -461,93 +260,8 @@ def _check_oversized_entities(entities, issues):
         )
 
 
-def _check_native_memory_health(memory_dir, issues,
-                                graph_entities=None):
-    """Check native auto-memory health.
-
-    If graph_entities is provided, uses it instead of
-    re-reading graph.jsonl (avoids double-read in doctor).
-    """
-    native_dir = _resolve_native_memory_dir(memory_dir)
-    if not os.path.isdir(native_dir):
-        return
-
-    index_path = os.path.join(native_dir, "MEMORY.md")
-    index_files = set()
-    if os.path.isfile(index_path):
-        with open(index_path, encoding='utf-8') as f:
-            for line in f:
-                m = re.search(r'\]\(([^)]+\.md)\)', line)
-                if m:
-                    index_files.add(m.group(1))
-
-    actual_files = set()
-    native_names = set()
-    for fname in os.listdir(native_dir):
-        if fname.endswith('.md') and fname != 'MEMORY.md':
-            actual_files.add(fname)
-            fpath = os.path.join(native_dir, fname)
-            try:
-                with open(fpath, encoding='utf-8') as f:
-                    content = f.read(500)
-                fm, _ = _parse_frontmatter(content)
-                native_names.add(
-                    fm.get('name', os.path.splitext(fname)[0])
-                )
-            except OSError:
-                continue
-
-    orphaned = actual_files - index_files
-    if orphaned:
-        issues.append(
-            f"Native: {len(orphaned)} files not in "
-            f"MEMORY.md index"
-        )
-    dangling = index_files - actual_files
-    if dangling:
-        issues.append(
-            f"Native: {len(dangling)} MEMORY.md entries "
-            f"point to missing files"
-        )
-
-    # Check for stale graph mirrors using provided entities
-    # or falling back to graph file scan
-    stale = 0
-    if graph_entities is not None:
-        for name, ent in graph_entities.items():
-            if ent.get('_migrated_from') == 'auto-memory':
-                if name.startswith('auto-memory: '):
-                    orig = name[len('auto-memory: '):]
-                    if orig not in native_names:
-                        stale += 1
-    else:
-        graph_path = os.path.join(memory_dir, "graph.jsonl")
-        if os.path.isfile(graph_path):
-            with open(graph_path, encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        if rec.get('_migrated_from') == 'auto-memory':
-                            name = rec.get('name', '')
-                            if name.startswith('auto-memory: '):
-                                orig = name[len('auto-memory: '):]
-                                if orig not in native_names:
-                                    stale += 1
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-    if stale:
-        issues.append(
-            f"Graph: {stale} migrated entities whose "
-            f"native source was removed"
-        )
-
-
 def _run_doctor(memory_dir):
-    """Health check across both memory stores."""
-    import time
+    """Health check for the knowledge graph."""
     from collections import Counter
     issues = []
     graph_path = os.path.join(memory_dir, "graph.jsonl")
@@ -586,15 +300,6 @@ def _run_doctor(memory_dir):
         type_counts = Counter()
         issues.append("No graph.jsonl found")
 
-    # Native memory health — pass loaded entities to avoid
-    # re-reading graph.jsonl
-    _check_native_memory_health(
-        memory_dir, issues, graph_entities=entities
-    )
-
-    native_dir = _resolve_native_memory_dir(memory_dir)
-    native_stats = _get_native_memory_stats(native_dir)
-
     status = "healthy" if not issues else "issues_found"
     result = {
         "status": status,
@@ -608,8 +313,6 @@ def _run_doctor(memory_dir):
         "issues": issues,
         "issue_count": len(issues),
     }
-    if native_stats:
-        result["native_memory"] = native_stats
 
     if sys.stdout.isatty():
         print(f"\n\033[1mMemory Doctor\033[0m — {status}")
@@ -618,12 +321,6 @@ def _run_doctor(memory_dir):
             f"  Graph: {g['entities']}e "
             f"{g['relations']}r"
         )
-        if native_stats:
-            ns = native_stats
-            type_str = ", ".join(
-                f"{c} {t}" for t, c in ns["by_type"].items()
-            )
-            print(f"  Native: {ns['total']} ({type_str})")
         if issues:
             print(f"\n  Issues ({len(issues)}):")
             for issue in issues:
@@ -635,259 +332,7 @@ def _run_doctor(memory_dir):
         print(json.dumps(result, indent=2))
 
 
-_WRITE_TOOLS = frozenset({
-    "create_entities", "create_relations",
-    "add_observations", "remove_observations",
-    "delete_entities", "rename_entity",
-    "create_decision", "update_decision_outcome",
-})
-
-
-# --- Native Memory Handlers ---
-
-def _mem_remember(a, memory_dir):
-    """Write to native auto-memory system.
-
-    Uses flock to prevent TOCTOU races between concurrent
-    remember calls with the same name.
-    """
-    body = a.get("body", a.get("query", ""))
-    mem_type = a.get("type", a.get("entity_type", "project"))
-    name = a.get("name", "")
-    description = a.get("description", "")
-
-    if not body and not description:
-        return {
-            "error": "body or description required — "
-            "usage: mem remember 'text'"
-        }
-
-    if not name:
-        words = re.sub(
-            r'[^a-zA-Z0-9\s]', '', body or description
-        ).split()[:5]
-        name = " ".join(words) if words else "unnamed"
-
-    if not description:
-        description = (body[:120] if body else name)
-
-    native_dir = _resolve_native_memory_dir(memory_dir)
-    os.makedirs(native_dir, exist_ok=True)
-
-    slug = re.sub(
-        r'[^a-z0-9_-]', '_', name.lower().strip()
-    )[:60].strip('_')
-    filename = f"{slug}.md"
-    filepath = os.path.join(native_dir, filename)
-
-    lock_fd, _ = _flock_native(native_dir)
-    try:
-        # Check for existing file with same name — update it
-        existing_file = None
-        for fname in os.listdir(native_dir):
-            if not fname.endswith('.md') or fname == 'MEMORY.md':
-                continue
-            fpath = os.path.join(native_dir, fname)
-            try:
-                with open(fpath, encoding='utf-8') as f:
-                    content = f.read(500)
-                fm, _ = _parse_frontmatter(content)
-                if fm.get('name', '').lower() == name.lower():
-                    existing_file = fpath
-                    filename = fname
-                    filepath = fpath
-                    break
-            except OSError:
-                continue
-
-        content = (
-            f"---\nname: {name}\n"
-            f"description: {description}\n"
-            f"type: {mem_type}\n---\n\n{body}\n"
-        )
-        tmp = filepath + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, filepath)
-
-        _update_memory_index(
-            native_dir, filename, name, description
-        )
-    finally:
-        _funlock_native(lock_fd)
-
-    action = "updated" if existing_file else "created"
-    return {
-        "status": "ok", "action": action,
-        "file": filepath, "type": mem_type, "name": name,
-    }
-
-
-def _mem_forget(a, memory_dir):
-    """Remove from native auto-memory system.
-
-    Uses rename-to-trash then rebuild-index then unlink
-    to prevent crash leaving dangling MEMORY.md entries.
-    """
-    name = a.get("name", a.get("query", ""))
-    if not name:
-        return {
-            "error": "name required — "
-            "usage: mem forget 'name'"
-        }
-
-    native_dir = _resolve_native_memory_dir(memory_dir)
-    if not os.path.isdir(native_dir):
-        return {"error": "no native memory directory found"}
-
-    lock_fd, _ = _flock_native(native_dir)
-    try:
-        # Reclaim orphaned .trash files from prior crashed runs
-        for fname in os.listdir(native_dir):
-            if fname.endswith('.md.trash'):
-                try:
-                    os.unlink(os.path.join(native_dir, fname))
-                except OSError:
-                    pass
-
-        removed = []
-        trash_files = []
-        for fname in os.listdir(native_dir):
-            if not fname.endswith('.md') or fname == 'MEMORY.md':
-                continue
-            fpath = os.path.join(native_dir, fname)
-            try:
-                with open(fpath, encoding='utf-8') as f:
-                    content = f.read(500)
-            except OSError:
-                continue
-            fm, _ = _parse_frontmatter(content)
-            if (fm.get('name', '').lower() == name.lower()
-                    or os.path.splitext(fname)[0].lower()
-                    == name.lower()):
-                # Rename to .trash first (crash-safe)
-                trash = fpath + ".trash"
-                os.rename(fpath, trash)
-                removed.append(fname)
-                trash_files.append(trash)
-
-        if removed:
-            # Rebuild index while files are gone
-            _rebuild_memory_index(native_dir)
-            # Now safe to delete trash
-            for tf in trash_files:
-                try:
-                    os.unlink(tf)
-                except OSError:
-                    pass
-            return {"status": "ok", "removed": removed}
-    finally:
-        _funlock_native(lock_fd)
-
-    return {"error": f"no memory found matching '{name}'"}
-
-
-def _mem_sync(a, memory_dir):
-    """Sync native auto-memory entries into the knowledge graph.
-
-    Writes through the .pending sidecar to avoid contention
-    with concurrent hook writers.
-    """
-    import time
-
-    native_dir = _resolve_native_memory_dir(memory_dir)
-    if not os.path.isdir(native_dir):
-        return {
-            "status": "ok", "migrated": 0,
-            "message": "No native memory directory",
-        }
-
-    graph_path = os.path.join(memory_dir, "graph.jsonl")
-    pending_path = os.path.join(
-        memory_dir, "graph.jsonl.pending"
-    )
-    existing = set()
-    # Read both graph and pending to check for existing entities
-    for fpath in (graph_path, pending_path):
-        if not os.path.isfile(fpath):
-            continue
-        try:
-            with open(fpath, encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        if rec.get('type') == 'entity':
-                            existing.add(rec.get('name', ''))
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-        except OSError:
-            pass
-
-    now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    migrated = 0
-
-    for fname in sorted(os.listdir(native_dir)):
-        if not fname.endswith('.md') or fname == 'MEMORY.md':
-            continue
-        fpath = os.path.join(native_dir, fname)
-        try:
-            with open(fpath, encoding='utf-8') as f:
-                content = f.read()
-        except OSError:
-            continue
-
-        fm, body = _parse_frontmatter(content)
-        name = fm.get('name', os.path.splitext(fname)[0])
-        entity_name = f'auto-memory: {name}'
-
-        if entity_name in existing:
-            continue
-
-        desc = fm.get('description', '')
-        observations = []
-        if desc:
-            observations.append(desc)
-        for bline in body.strip().splitlines():
-            bline = bline.strip()
-            if bline and len(bline) > 3:
-                observations.append(bline[:200])
-
-        if not observations:
-            continue
-
-        entity = {
-            'type': 'entity',
-            'name': entity_name,
-            'entityType': fm.get('type', 'reference'),
-            'observations': observations,
-            '_created': now,
-            '_updated': now,
-            '_migrated_from': 'auto-memory',
-        }
-        # Write to sidecar, not graph directly
-        with open(pending_path, 'a', encoding='utf-8') as f:
-            f.write(
-                json.dumps(entity, separators=(',', ':'))
-                + '\n'
-            )
-            f.flush()
-            os.fsync(f.fileno())
-        existing.add(entity_name)
-        migrated += 1
-
-    # Merge sidecar into graph
-    if migrated:
-        _merge_pending(memory_dir)
-
-    return {"status": "ok", "migrated": migrated}
-
-
-# --- Unified Tool Handlers ---
+# --- Unified tool handlers ---
 
 def _unified_search(a, memory_dir):
     from semantic_server.search import search, search_by_time
@@ -910,48 +355,11 @@ def _unified_search(a, memory_dir):
     query = a.get("query", "")
     top_k = a.get("top_k", 5)
 
-    # Graph search
-    graph_result = search(
-        query, memory_dir, top_k=top_k * 2,
+    return search(
+        query, memory_dir, top_k=top_k,
         branch=a.get("branch"),
         compact=a.get("compact", False),
     )
-
-    # Native memory search
-    native_dir = _resolve_native_memory_dir(memory_dir)
-    native_results = _search_native_memories(query, native_dir)
-
-    # Merge: graph first, then enrich or append native
-    merged = list(graph_result.get("results", []))
-    graph_names = {r.get("entity", "").lower() for r in merged}
-    for nr in native_results:
-        nr_name = nr["entity"].lower()
-        if nr_name not in graph_names:
-            merged.append(nr)
-        else:
-            # Merge supplementary observations from native
-            # into the matching graph result
-            for gr in merged:
-                if gr.get("entity", "").lower() == nr_name:
-                    existing_obs = set(
-                        gr.get("observations", [])
-                    )
-                    for obs in nr.get("observations", []):
-                        if obs and obs not in existing_obs:
-                            gr.setdefault(
-                                "observations", []
-                            ).append(obs)
-                    break
-
-    return {
-        "results": merged[:top_k],
-        "total_indexed": graph_result.get("total_indexed", 0),
-        "native_matches": len(native_results),
-        "sources": {
-            "graph": len(graph_result.get("results", [])),
-            "native": len(native_results),
-        },
-    }
 
 
 def _auto_create_relation_entities(rels, ents, memory_dir,
@@ -1111,22 +519,13 @@ def _unified_status(a, memory_dir):
                 d.get("title", "") for d in pending[:5]
             ],
         }
-
-    # Native memory stats
-    native_dir = _resolve_native_memory_dir(memory_dir)
-    native_stats = _get_native_memory_stats(native_dir)
-    if native_stats:
-        stats["native_memory"] = native_stats
     return stats
 
 
-# --- New Intelligence Commands ---
+# --- Diff ---
 
 def _run_diff(memory_dir):
     """Show entities changed since last session."""
-    import time
-    from datetime import datetime, timezone
-
     marker = os.path.join(memory_dir, ".last-session-start")
     try:
         with open(marker) as f:
@@ -1135,8 +534,9 @@ def _run_diff(memory_dir):
         last_ts = None
 
     if not last_ts:
+        mem = os.path.expanduser("~/.claude/memory/mem")
         print("No previous session recorded. "
-              "Run `mem status` in a new session first.")
+              f"Run `{mem} status` in a new session first.")
         return
 
     graph_path = os.path.join(memory_dir, "graph.jsonl")
@@ -1147,7 +547,6 @@ def _run_diff(memory_dir):
 
     try:
         with open(graph_path, encoding="utf-8") as f:
-            # Single-pass: collect latest state per entity
             entities = {}
             for line in f:
                 line = line.strip()
@@ -1181,8 +580,6 @@ def _run_diff(memory_dir):
 
     for name, info in entities.items():
         etype = info.get("entityType", "")
-        if etype == "activity-log":
-            continue
         created = info.get("_created", "")
         updated = info.get("_updated", "")
         if created and created > last_ts:
@@ -1193,7 +590,6 @@ def _run_diff(memory_dir):
             else:
                 new_entities.append(entry)
         elif updated and updated > last_ts:
-            # Check if decision got resolved
             if etype == "decision":
                 obs = info.get("observations", [])
                 resolved = any(
@@ -1269,511 +665,23 @@ def _run_diff(memory_dir):
         }, indent=2))
 
 
-def _run_context(memory_dir, filepath):
-    """File-specific entity recall — show everything relevant to a file."""
-    from semantic_server.graph import (
-        load_graph_entities, load_graph_relations,
-    )
-    from semantic_server.search import search
-
-    if not filepath:
-        print(json.dumps({"error": "filepath required"}))
-        return
-
-    basename = os.path.basename(filepath).lower()
-    stem = os.path.splitext(basename)[0].lower()
-
-    entities = load_graph_entities(memory_dir)
-    relations = load_graph_relations(memory_dir)
-
-    # Find entities that mention this file
-    matched = []
-    for name, info in entities.items():
-        etype = info.get("entityType", "")
-        if etype == "activity-log":
-            continue
-        name_lower = name.lower()
-        # Direct name match
-        if basename in name_lower or stem in name_lower:
-            matched.append((name, info, "name_match"))
-            continue
-        # Observation match
-        for obs in info.get("observations", []):
-            if isinstance(obs, str) and (
-                basename in obs.lower()
-                or stem in obs.lower()
-            ):
-                matched.append((name, info, "observation"))
-                break
-
-    # Also run a search for the filename
-    sr = search(stem, memory_dir, top_k=5, compact=True)
-    search_names = {r.get("entity") for r in sr.get("results", [])}
-
-    # Build relation map for matched entities
-    rel_map = {}
-    for r in relations:
-        fr = r.get("from", "")
-        to = r.get("to", "")
-        rt = r.get("relationType", "")
-        rel_map.setdefault(fr, []).append((to, rt))
-        rel_map.setdefault(to, []).append((fr, rt))
-
-    # Categorize results
-    warnings = []
-    decisions = []
-    related = []
-    for name, info, match_type in matched:
-        etype = info.get("entityType", "")
-        if etype == "file-warning":
-            warnings.append((name, info))
-        elif etype == "decision":
-            decisions.append((name, info))
-        else:
-            related.append((name, info))
-
-    # Add search results not already matched
-    matched_names = {m[0] for m in matched}
-    for r in sr.get("results", []):
-        ename = r.get("entity", "")
-        if ename not in matched_names:
-            info = entities.get(ename, {})
-            if info:
-                etype = info.get("entityType", "")
-                if etype == "file-warning":
-                    warnings.append((ename, info))
-                elif etype == "decision":
-                    decisions.append((ename, info))
-                elif etype != "activity-log":
-                    related.append((ename, info))
-
-    if sys.stdout.isatty():
-        total = len(warnings) + len(decisions) + len(related)
-        if total == 0:
-            print(f"No context found for '{filepath}'.")
-            return
-        print(
-            f"\n\033[1mContext for {basename}\033[0m "
-            f"({total} entities)\n"
-        )
-        if warnings:
-            print(f"  \033[31mWarnings ({len(warnings)}):\033[0m")
-            for name, info in warnings:
-                for obs in info.get("observations", [])[:3]:
-                    if isinstance(obs, str):
-                        print(f"    ! {obs}")
-        if decisions:
-            print(f"  \033[35mDecisions ({len(decisions)}):\033[0m")
-            for name, info in decisions:
-                display = name
-                if display.lower().startswith("decision: "):
-                    display = display[10:]
-                obs = info.get("observations", [])
-                rationale = ""
-                outcome = "pending"
-                for o in obs:
-                    if isinstance(o, str):
-                        if o.startswith("Rationale: "):
-                            rationale = o[11:][:80]
-                        elif (o.startswith("Outcome: ")
-                              and not o.startswith(
-                                  "Outcome: pending")):
-                            outcome = o[9:]
-                print(f"    {display} [{outcome}]")
-                if rationale:
-                    print(f"      {rationale}")
-        if related:
-            print(f"  \033[36mRelated ({len(related)}):\033[0m")
-            for name, info in related[:10]:
-                etype = info.get("entityType", "")
-                tag = f" ({etype})" if etype else ""
-                conns = rel_map.get(name, [])
-                conn_str = ""
-                if conns:
-                    conn_names = [c[0] for c in conns[:3]]
-                    conn_str = (
-                        f" -> {', '.join(conn_names)}"
-                    )
-                print(f"    {name}{tag}{conn_str}")
-            if len(related) > 10:
-                print(f"    +{len(related) - 10} more")
-        print()
-    else:
-        print(json.dumps({
-            "file": filepath,
-            "warnings": [
-                {"name": n, "observations": i.get(
-                    "observations", [])[:3]}
-                for n, i in warnings
-            ],
-            "decisions": [
-                {"name": n, "observations": i.get(
-                    "observations", [])[:3]}
-                for n, i in decisions
-            ],
-            "related": [
-                {"name": n, "entityType": i.get(
-                    "entityType", "")}
-                for n, i in related
-            ],
-        }, indent=2))
-
-
-def _run_impact(memory_dir, entity_name, max_depth=3):
-    """Impact analysis: what depends on this entity."""
-    from semantic_server.graph import (
-        load_graph_entities, load_graph_relations,
-    )
-
-    if not entity_name:
-        print(json.dumps({"error": "entity name required"}))
-        return
-
-    entities = load_graph_entities(memory_dir)
-    relations = load_graph_relations(memory_dir)
-
-    if entity_name not in entities:
-        # Try case-insensitive match
-        for name in entities:
-            if name.lower() == entity_name.lower():
-                entity_name = name
-                break
-        else:
-            print(json.dumps({
-                "error": f"Entity '{entity_name}' not found"
-            }))
-            return
-
-    # BFS: find all entities reachable via inbound relations
-    # (what depends ON this entity)
-    outbound = {}
-    inbound = {}
-    for r in relations:
-        fr = r.get("from", "")
-        to = r.get("to", "")
-        rt = r.get("relationType", "")
-        outbound.setdefault(fr, []).append((to, rt))
-        inbound.setdefault(to, []).append((fr, rt))
-
-    # Collect dependents (entities that point TO this one)
-    dependents = []
-    visited = {entity_name}
-    frontier = [entity_name]
-    for depth in range(max_depth):
-        next_frontier = []
-        for node in frontier:
-            for src, rt in inbound.get(node, []):
-                if src not in visited:
-                    visited.add(src)
-                    next_frontier.append(src)
-                    info = entities.get(src, {})
-                    dependents.append({
-                        "name": src,
-                        "type": info.get("entityType", ""),
-                        "relation": rt,
-                        "depth": depth + 1,
-                    })
-        frontier = next_frontier
-        if not frontier:
-            break
-
-    # Collect dependencies (entities this one points TO)
-    dependencies = []
-    for to, rt in outbound.get(entity_name, []):
-        info = entities.get(to, {})
-        dependencies.append({
-            "name": to,
-            "type": info.get("entityType", ""),
-            "relation": rt,
-        })
-
-    # Find decisions that reference this entity
-    related_decisions = []
-    for name, info in entities.items():
-        if info.get("entityType") != "decision":
-            continue
-        # Check if any observation mentions the entity
-        for obs in info.get("observations", []):
-            if (isinstance(obs, str)
-                    and entity_name.lower() in obs.lower()):
-                display = name
-                if display.lower().startswith("decision: "):
-                    display = display[10:]
-                outcome = "pending"
-                for o in info.get("observations", []):
-                    if (isinstance(o, str)
-                            and o.startswith("Outcome: ")
-                            and not o.startswith(
-                                "Outcome: pending")):
-                        outcome = o[9:]
-                related_decisions.append({
-                    "name": display, "outcome": outcome
-                })
-                break
-    # Also check relation-connected decisions
-    for to, rt in outbound.get(entity_name, []):
-        info = entities.get(to, {})
-        if info.get("entityType") == "decision":
-            display = to
-            if display.lower().startswith("decision: "):
-                display = display[10:]
-            if not any(d["name"] == display
-                       for d in related_decisions):
-                related_decisions.append({
-                    "name": display, "outcome": "linked",
-                })
-    for src, rt in inbound.get(entity_name, []):
-        info = entities.get(src, {})
-        if info.get("entityType") == "decision":
-            display = src
-            if display.lower().startswith("decision: "):
-                display = display[10:]
-            if not any(d["name"] == display
-                       for d in related_decisions):
-                related_decisions.append({
-                    "name": display, "outcome": "linked",
-                })
-
-    # Entity's own info
-    info = entities[entity_name]
-
-    if sys.stdout.isatty():
-        etype = info.get("entityType", "")
-        tag = f" ({etype})" if etype else ""
-        n_obs = len(info.get("observations", []))
-        print(
-            f"\n\033[1mImpact: {entity_name}{tag}\033[0m"
-            f" ({n_obs} observations)\n"
-        )
-        if dependencies:
-            print(
-                f"  \033[36mDependencies "
-                f"({len(dependencies)}):\033[0m"
-            )
-            for d in dependencies:
-                tag = f" ({d['type']})" if d['type'] else ""
-                rel = f" [{d['relation']}]" if d['relation'] else ""
-                print(f"    -> {d['name']}{tag}{rel}")
-        if dependents:
-            print(
-                f"  \033[33mDependents "
-                f"({len(dependents)}):\033[0m"
-            )
-            for d in dependents[:15]:
-                tag = f" ({d['type']})" if d['type'] else ""
-                rel = f" [{d['relation']}]" if d['relation'] else ""
-                depth_s = f" (depth {d['depth']})" if d['depth'] > 1 else ""
-                print(
-                    f"    <- {d['name']}{tag}{rel}{depth_s}"
-                )
-            if len(dependents) > 15:
-                print(f"    +{len(dependents) - 15} more")
-        if related_decisions:
-            print(
-                f"  \033[35mDecisions "
-                f"({len(related_decisions)}):\033[0m"
-            )
-            for d in related_decisions:
-                print(
-                    f"    {d['name']} [{d['outcome']}]"
-                )
-        if not dependencies and not dependents and not related_decisions:
-            print("  No impact connections found.")
-        print()
-    else:
-        print(json.dumps({
-            "entity": entity_name,
-            "entityType": info.get("entityType", ""),
-            "dependencies": dependencies,
-            "dependents": dependents,
-            "related_decisions": related_decisions,
-        }, indent=2))
-
-
-def _run_viz(memory_dir, entity_name=None):
-    """Output DOT graph for visualization."""
-    from semantic_server.graph import (
-        load_graph_entities, load_graph_relations,
-    )
-    entities = load_graph_entities(memory_dir)
-    relations = load_graph_relations(memory_dir)
-    if not entities:
-        print("digraph memory { label=\"Empty graph\"; }")
-        return
-
-    if entity_name and entity_name not in entities:
-        print(
-            f"digraph memory {{ label=\"Entity "
-            f"'{entity_name}' not found\"; }}",
-        )
-        return
-    if entity_name and entity_name in entities:
-        relevant = {entity_name}
-        for r in relations:
-            if r.get("from") == entity_name:
-                relevant.add(r["to"])
-            elif r.get("to") == entity_name:
-                relevant.add(r["from"])
-        hop2 = set()
-        for r in relations:
-            if r.get("from") in relevant:
-                hop2.add(r["to"])
-            elif r.get("to") in relevant:
-                hop2.add(r["from"])
-        relevant |= hop2
-    else:
-        relevant = set(entities.keys())
-
-    _TYPE_COLORS = {
-        "component": "#4A90D9", "service": "#7B68EE",
-        "decision": "#FFD700", "file-warning": "#FF6347",
-        "module": "#3CB371", "function": "#20B2AA",
-        "bug": "#FF4500", "activity-log": "#808080",
-    }
-
-    lines = [
-        'digraph memory {', '  rankdir=LR;',
-        '  node [shape=box, style="rounded,filled",'
-        ' fontname="Helvetica"];',
-        '  edge [fontname="Helvetica", fontsize=10];',
-    ]
-    for name in relevant:
-        if name not in entities:
-            continue
-        info = entities[name]
-        etype = info.get("entityType", "")
-        color = _TYPE_COLORS.get(etype, "#D3D3D3")
-        label = name.replace('"', '\\"')
-        if etype:
-            label += f"\\n({etype})"
-        lines.append(
-            f'  "{name}" [label="{label}",'
-            f' fillcolor="{color}"];'
-        )
-    for r in relations:
-        fr, to = r.get("from", ""), r.get("to", "")
-        if fr in relevant and to in relevant:
-            rt = r.get("relationType", "")
-            rt_label = (
-                f' [label="{rt}"]' if rt else ""
-            )
-            lines.append(f'  "{fr}" -> "{to}"{rt_label};')
-    lines.append("}")
-    print("\n".join(lines))
-
-
-def _run_timeline(memory_dir, global_mode=False):
-    """Show recent activity across one or all projects."""
-    import glob as _glob
-    from datetime import datetime, timezone
-
-    dirs = []
-    if global_mode:
-        home = os.path.expanduser("~")
-        for pattern in [
-            os.path.join(home, "*", ".memory"),
-            os.path.join(home, "*", "*", ".memory"),
-            os.path.join(home, "projects", "*", ".memory"),
-            os.path.join(home, "code", "*", ".memory"),
-        ]:
-            dirs.extend(_glob.glob(pattern))
-        seen = set()
-        unique = []
-        for d in dirs:
-            rp = os.path.realpath(d)
-            if rp not in seen:
-                seen.add(rp)
-                unique.append(d)
-        dirs = unique
-    else:
-        dirs = [memory_dir]
-
-    entries = []
-    for md in dirs:
-        graph_path = os.path.join(md, "graph.jsonl")
-        project = os.path.basename(os.path.dirname(md))
-        try:
-            with open(
-                graph_path, encoding="utf-8",
-                errors="replace",
-            ) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        if obj.get("type") != "entity":
-                            continue
-                        updated = obj.get("_updated", "")
-                        if not updated:
-                            continue
-                        entries.append({
-                            "project": project,
-                            "name": obj.get("name", ""),
-                            "type": obj.get("entityType", ""),
-                            "updated": updated,
-                        })
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-        except OSError:
-            continue
-
-    entries.sort(key=lambda e: e["updated"], reverse=True)
-
-    if sys.stdout.isatty():
-        print(
-            f"\nTimeline ({len(entries)} entities"
-            + (
-                " across projects" if global_mode else ""
-            )
-            + "):\n"
-        )
-        for e in entries[:30]:
-            proj = (
-                f"[{e['project']}] " if global_mode else ""
-            )
-            etype = (
-                f"({e['type']})" if e['type'] else ""
-            )
-            print(
-                f"  {e['updated'][:16]}  "
-                f"{proj}{e['name']} {etype}"
-            )
-        if len(entries) > 30:
-            print(f"\n  ... +{len(entries) - 30} more")
-        print()
-    else:
-        print(json.dumps({"entries": entries[:50]}, indent=2))
-
+# --- TTY formatting ---
 
 def _format_tty_output(tool_name, result):
     """Format result for human-readable TTY output."""
-    if tool_name in ("search", "recall",
-                     "memory_search", "memory_recall"):
+    if tool_name in ("search", "recall"):
         res_list = result.get("results", [])
-        sources = result.get("sources", {})
-        source_info = ""
-        if sources:
-            source_info = (
-                f" (graph:{sources.get('graph', 0)}"
-                f" native:{sources.get('native', 0)})"
-            )
         print(
-            f"Search{source_info} "
+            f"Search "
             f"({result.get('total_indexed', 0)} indexed):"
         )
         for r in res_list:
             name = r.get("entity", "")
             etype = r.get("entityType", "")
             score = r.get("score", 0.0)
-            tag = (
-                " \033[35m[native]\033[0m"
-                if r.get("source") == "native" else ""
-            )
             print(
                 f"\n- \033[1;36m{name}\033[0m "
-                f"({etype}) [score: {score:.2f}]{tag}"
+                f"({etype}) [score: {score:.2f}]"
             )
             if "observations" in r:
                 for obs in r["observations"]:
@@ -1788,21 +696,10 @@ def _format_tty_output(tool_name, result):
                     print(
                         f"    \u21b3 {', '.join(conns)}"
                     )
-    elif tool_name in ("status", "memory_status",
-                       "graph_stats"):
+    elif tool_name == "status":
         print("\n\033[1mMemory Diagnostics\033[0m")
         for k, v in result.items():
-            if k == "native_memory" and isinstance(v, dict):
-                total = v.get("total", 0)
-                by_type = v.get("by_type", {})
-                type_str = ", ".join(
-                    f"{c} {t}" for t, c in by_type.items()
-                )
-                print(
-                    f"\n  \033[1mNative Memory:\033[0m"
-                    f" {total} ({type_str})"
-                )
-            elif (isinstance(v, dict)
+            if (isinstance(v, dict)
                     and k == "decision_nudge"):
                 print(
                     f"\n  \033[1;33m\u26a0\ufe0f  "
@@ -1821,14 +718,13 @@ def _format_tty_output(tool_name, result):
         print(json.dumps(result, indent=2))
 
 
+# --- Arg parsing ---
+
 def _parse_tool_args(tool_name, extra_args):
     """Parse CLI arguments into a tool_args dict."""
     _POSITIONAL_TOOLS = {
         "search", "recall", "status",
-        "doctor", "rebuild_index",
-        "viz", "timeline",
-        "remember", "forget", "sync",
-        "diff", "context", "impact",
+        "doctor", "rebuild", "diff",
     }
     if tool_name in _POSITIONAL_TOOLS:
         return _parse_positional(extra_args)
@@ -1863,24 +759,15 @@ def main():
     tool_name = args[0]
     extra_args = args[1:]
 
-    # --- Unified tool aliases -> legacy names ---
-    _ALIASES = {
-        "rebuild": "rebuild_index",
-    }
-    tool_name = _ALIASES.get(tool_name, tool_name)
-
     tool_args = _parse_tool_args(tool_name, extra_args)
 
-    # --- Auto-Init Logic ---
+    # --- Auto-Init ---
     if not os.path.isdir(memory_dir):
         try:
             os.makedirs(memory_dir, exist_ok=True)
-            graph_path = os.path.join(
-                memory_dir, "graph.jsonl"
-            )
-            if not os.path.exists(graph_path):
-                with open(graph_path, "a"):
-                    pass
+            # "a" mode creates if not exists, no-op if exists
+            with open(os.path.join(memory_dir, "graph.jsonl"), "a"):
+                pass
             if sys.stdout.isatty():
                 print(
                     f"Initialized knowledge graph at "
@@ -1899,7 +786,7 @@ def main():
     _merge_pending(memory_dir)
 
     # --- Commands that don't need semantic_server ---
-    if tool_name in ("rebuild_index", "rebuild"):
+    if tool_name == "rebuild":
         import maintenance
         indexed = maintenance.rebuild_index(memory_dir)
         print(json.dumps({
@@ -1912,91 +799,11 @@ def main():
         _run_doctor(memory_dir)
         return
 
-    if tool_name == "remember":
-        result = _mem_remember(tool_args, memory_dir)
-        if sys.stdout.isatty() and not result.get("error"):
-            action = result.get("action", "created")
-            print(
-                f"\033[32m{action}\033[0m "
-                f"{result.get('name', '')} "
-                f"({result.get('type', '')}) "
-                f"-> {result.get('file', '')}"
-            )
-        else:
-            print(json.dumps(result, indent=2))
-        return
-
-    if tool_name == "forget":
-        result = _mem_forget(tool_args, memory_dir)
-        if sys.stdout.isatty() and not result.get("error"):
-            removed = result.get("removed", [])
-            print(
-                f"\033[31mremoved\033[0m "
-                f"{', '.join(removed)}"
-            )
-        else:
-            print(json.dumps(result, indent=2))
-        return
-
-    if tool_name == "sync":
-        result = _mem_sync(tool_args, memory_dir)
-        if sys.stdout.isatty():
-            migrated = result.get("migrated", 0)
-            print(f"Synced: {migrated} native -> graph")
-        else:
-            print(json.dumps(result, indent=2))
-        if result.get("migrated", 0) > 0:
-            try:
-                import maintenance
-                maintenance.rebuild_index(memory_dir)
-            except Exception:
-                pass
-        return
-
-    if tool_name == "viz":
-        entity = extra_args[0] if extra_args else None
-        _run_viz(memory_dir, entity)
-        return
-
-    if tool_name == "timeline":
-        global_mode = "--global" in extra_args
-        _run_timeline(memory_dir, global_mode)
-        return
-
     if tool_name == "diff":
         _run_diff(memory_dir)
         return
 
-    if tool_name == "context":
-        filepath = tool_args.get("query", "")
-        _run_context(memory_dir, filepath)
-        return
-
-    if tool_name == "impact":
-        entity = tool_args.get("query", "")
-        depth = tool_args.get("depth", 3)
-        _run_impact(memory_dir, entity, max_depth=depth)
-        return
-
     # --- Commands that need semantic_server ---
-    from semantic_server.search import (
-        search, search_by_time,
-    )
-    from semantic_server.tools import (
-        add_observations,
-        create_decision,
-        create_entities,
-        create_relations,
-        delete_entities,
-        graph_stats,
-        list_decisions,
-        remove_observations,
-        rename_entity,
-        update_decision_outcome,
-    )
-    from semantic_server.traverse import (
-        traverse_relations,
-    )
     from semantic_server.graph import load_index
     from semantic_server.recall import (
         init_recall_state,
@@ -2014,118 +821,18 @@ def main():
         )
 
     dispatch = {
-        # --- Unified tools ---
         "search": lambda a: _unified_search(a, memory_dir),
         "write": lambda a: _unified_write(a, memory_dir),
         "recall": lambda a: _unified_recall(a, memory_dir),
         "decide": lambda a: _unified_decide(a, memory_dir),
         "remove": lambda a: _unified_remove(a, memory_dir),
         "status": lambda a: _unified_status(a, memory_dir),
-        # --- Legacy tools (backward compat) ---
-        "semantic_search_memory": lambda a: search(
-            a.get("query", ""),
-            memory_dir,
-            a.get("top_k", 5),
-            branch=a.get("branch"),
-            compact=a.get("compact", False),
-        ),
-        "traverse_relations": lambda a: (
-            traverse_relations(
-                a.get("entity", ""),
-                memory_dir,
-                a.get("direction", "both"),
-                a.get("max_depth", 2),
-            )
-        ),
-        "search_memory_by_time": lambda a: (
-            search_by_time(
-                memory_dir,
-                a.get("since"),
-                a.get("until"),
-                a.get("limit", 20),
-                branch_filter=a.get("branch_filter"),
-                entity_type=a.get("entity_type"),
-            )
-        ),
-        "create_entities": lambda a: (
-            create_entities(
-                a.get("entities", []),
-                memory_dir,
-            )
-        ),
-        "create_relations": lambda a: (
-            create_relations(
-                a.get("relations", []),
-                memory_dir,
-            )
-        ),
-        "add_observations": lambda a: (
-            add_observations(
-                a.get("entity", ""),
-                a.get("observations", []),
-                memory_dir,
-            )
-        ),
-        "remove_observations": lambda a: (
-            remove_observations(
-                a.get("entity", ""),
-                a.get("observations", []),
-                memory_dir,
-            )
-        ),
-        "delete_entities": lambda a: (
-            delete_entities(
-                a.get("entity_names", []),
-                memory_dir,
-            )
-        ),
-        "rename_entity": lambda a: (
-            rename_entity(
-                a.get("old_name", ""),
-                a.get("new_name", ""),
-                memory_dir,
-            )
-        ),
-        "create_decision": lambda a: (
-            create_decision(a, memory_dir)
-        ),
-        "update_decision_outcome": lambda a: (
-            update_decision_outcome(a, memory_dir)
-        ),
-        "list_decisions": lambda a: (
-            list_decisions(
-                memory_dir,
-                stale_days=a.get("stale_days"),
-            )
-        ),
-        "graph_stats": lambda a: (
-            graph_stats(memory_dir)
-        ),
-        # Aliases
-        "memory_search": lambda a: (
-            _unified_search(a, memory_dir)
-        ),
-        "memory_write": lambda a: (
-            _unified_write(a, memory_dir)
-        ),
-        "memory_recall": lambda a: (
-            _unified_recall(a, memory_dir)
-        ),
-        "memory_decide": lambda a: (
-            _unified_decide(a, memory_dir)
-        ),
-        "memory_remove": lambda a: (
-            _unified_remove(a, memory_dir)
-        ),
-        "memory_status": lambda a: (
-            _unified_status(a, memory_dir)
-        ),
     }
 
     handler = dispatch.get(tool_name)
     if handler is None:
         print(
-            f"Error: unknown tool '{tool_name}'",
+            f"Error: unknown command '{tool_name}'",
             file=sys.stderr,
         )
         _usage()
@@ -2146,12 +853,7 @@ def main():
         print(json.dumps(result, indent=2))
 
     # Rebuild index after write ops
-    _WRITE_OPS = _WRITE_TOOLS | {
-        "write", "memory_write",
-        "decide", "memory_decide",
-        "remove", "memory_remove",
-    }
-    if tool_name in _WRITE_OPS:
+    if tool_name in ("write", "decide", "remove"):
         try:
             import maintenance
             maintenance.rebuild_index(memory_dir)
@@ -2162,7 +864,7 @@ def main():
                 file=sys.stderr,
             )
 
-    # Flush recall counts (no-op if nothing changed)
+    # Flush recall counts
     try:
         flush_recall_counts()
     except Exception:

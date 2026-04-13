@@ -24,7 +24,7 @@ Session 2: "How does sync work?"     ──▶ Recall Decision + Graph Neighbors
 |  **1** | [**Memory Advantage**](#1-memory-advantage)         | Branch-aware · Hebbian · Atomic Resilience |
 |  **2** | [**How It Works**](#2-how-it-works)                 | Graph · Tool Reference · Search · Maintenance |
 |  **3** | [**Getting Started**](#3-getting-started)           | First Run · Installation · Script Summary |
-|  **4** | [**Operations & Usage**](#4-operations--usage)       | Zero Effort · Session Walkthrough · Sync · Cleanup |
+|  **4** | [**Operations & Usage**](#4-operations--usage)       | Zero Effort · Session Walkthrough · Export · Cleanup |
 |  **5** | [**Decision Tracking**](#5-decision-tracking)       | Record · List · Update Outcome |
 |  **6** | [**Configuration**](#6-configuration)               | Limits · Tuning · Default Values |
 |  **7** | [**Architecture & Design**](#7-architecture--design)| Design Philosophy · Layout · Package Internals |
@@ -62,7 +62,7 @@ Architecture-aware memory, not just flat files.
 │  │ Session Start│    │ During Session │    │ Session End         │  │
 │  │              │    │                │    │                     │  │
 │  │ prime-       │    │  CLI Bridge    │    │ capture-decisions   │  │
-│  │ memory.sh    │──▶ │  (14 tools)    │──▶ │ reminds Claude to   │  │
+│  │ memory.sh    │──▶ │  (9 commands)  │──▶ │ reminds Claude to   │  │
 │  │              │    │                │    │ persist decisions   │  │
 │  └──────┬───────┘    └───────┬────────┘    └─────────────────────┘  │
 │         │                    │                                      │
@@ -113,18 +113,19 @@ Entities carry facts, branch tags, and timestamps. Relations form directed edges
 
 ### b. Tool Reference
 
-Standardized interface via `memory-cli.py` (or the `mem` wrapper).
+All access via the `mem` CLI wrapper (backed by `memory-cli.py`).
 
 | Command       | Role                                               |
 | ------------- | -------------------------------------------------- |
 | `mem search`  | Ranked lexical lookup (TF-IDF + Porter Stemming)   |
 | `mem recall`  | Smart context: Search + 1-hop graph neighbors      |
 | `mem write`   | Create/merge entities, relations, and observations |
-| `mem remove`  | Atomic deletion or renaming                        |
 | `mem decide`  | Track architectural trade-offs & rationales        |
+| `mem remove`  | Atomic deletion or renaming                        |
 | `mem status`  | Real-time health, stats, and pending nudges        |
-| `mem rebuild` | Force a global project re-scan & index update      |
+| `mem diff`    | Changes since last session                         |
 | `mem doctor`  | Locate orphans, technical debt, and stale indices  |
+| `mem rebuild` | Force a global project re-scan & index update      |
 
 ### c. How Search Works
 
@@ -160,7 +161,7 @@ Four hooks, CLI only. VSCode detected and skipped in <1ms — `CLAUDE.md` handle
 | Hook                      | Event        | Action                                                               |
 | ------------------------- | ------------ | -------------------------------------------------------------------- |
 | `prime-memory.sh`         | SessionStart | Maintenance + scored recall with 1-hop relations + pending decisions |
-| `capture-tool-context.sh` | PostToolUse  | File edits → graph observations (throttled 1x/30s)                   |
+| `capture-tool-context.sh` | PostToolUse  | Surface file warnings from graph (throttled 1x/30s)                  |
 | `capture-decisions.sh`    | Stop         | Persist-decisions reminder                                           |
 | `nudge-setup.sh`          | SessionStart | One-time setup notice (no `.memory/`)                                |
 
@@ -183,10 +184,10 @@ export PATH="$HOME/.claude/memory:$PATH"
 mem status
 ```
 
-| Script                 | What it does                                                                                                |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------- |
-| **`install.sh`**       | Deploys runtime, CLI bridge, hooks, wires `settings.json`                                                   |
-| **`setup-project.sh`** | Creates `.memory/`, injects bridge into `CLAUDE.md`, bootstraps graph (up to 200 files), removes legacy MCP |
+| Script                 | What it does                                                                                    |
+| ---------------------- | ----------------------------------------------------------------------------------------------- |
+| **`install.sh`**       | Deploys runtime, CLI bridge, hooks, wires `settings.json`                                       |
+| **`setup-project.sh`** | Creates `.memory/`, injects bridge into `CLAUDE.md`, migrates auto-memory, removes legacy MCP   |
 
 ---
 
@@ -206,26 +207,23 @@ The hooks and `CLAUDE.md` handle everything. No commands to memorize, no workflo
 
 ```
 1. USER: "How does our sync handle conflicts?"
-   Claude → semantic_search_memory("sync conflict") → SyncManager (0.87)
-   Claude → traverse_relations("SyncManager") → ProviderRegistry, ConfigStore
+   Claude → mem search "sync conflict" → SyncManager (0.87)
+   Claude → mem recall "SyncManager" → ProviderRegistry, ConfigStore
 
 2. USER: "Switch from LWW to CRDT"
-   Claude edits code → hooks capture observations
-   Claude silently: create_decision({
-     title: "Switch from LWW to CRDT",
-     chosen: "CRDT merge",
-     rationale: "Preserve concurrent edits",
-     alternatives: ["LWW — simpler but loses writes"]
-   })
+   Claude edits code
+   Claude silently: mem decide '{"title":"Switch from LWW to CRDT",
+     "chosen":"CRDT merge","rationale":"Preserve concurrent edits",
+     "alternatives":["LWW — simpler but loses writes"]}'
 ```
 
-### c. Day-Two - Sync & Cleanup
+### c. Day-Two - Export & Cleanup
 
 ```bash
 # Update — re-run both to refresh graph/bridge
 ./install.sh && ./setup-project.sh /path/to/project
 
-# Sync — portable JSON bundles for cross-machine memory
+# Export — portable JSON bundles for cross-machine memory
 ./export-memory.sh /path/to/project            # → portable bundle
 ./import-memory.sh bundle.json /path/to/project # → merge with dedup
 
@@ -254,12 +252,16 @@ mem decide '{
 ### b. List Decisions
 
 ```bash
-mem status # or list_decisions via tool
+mem status
 ```
 
-Returns all decisions sorted by recency with their current outcome status.
+Returns all decisions sorted by recency with their current outcome status. Pending decisions older than 2 days are flagged.
 
 ### c. Update the Outcome
+
+```bash
+mem decide '{"action":"resolve","title":"Use PostgreSQL over MongoDB","outcome":"successful","lesson":"ACID saved us during billing migration"}'
+```
 
 Outcomes: `pending` · `successful` · `failed` · `revised` · `adopted` · `rejected` · `deferred`
 
@@ -293,12 +295,12 @@ Outcomes: `pending` · `successful` · `failed` · `revised` · `adopted` · `re
 ~/.claude/                            GLOBAL RUNTIME
   hooks/
     prime-memory.sh                   SessionStart → maintenance + recall
-    capture-tool-context.sh/.py       PostToolUse → observations
+    capture-tool-context.sh/.py       PostToolUse → file warnings
     capture-decisions.sh              Stop → decision reminder
   memory/
     maintenance.py                    Decay / prune / merge / TF-IDF
     memory-cli.py                     CLI bridge (primary access)
-    semantic_server/                  12-module tool package
+    semantic_server/                  Tool package (16 modules)
 
 <project>/                            PER-PROJECT
   CLAUDE.md                           Bridge instructions
@@ -326,13 +328,13 @@ Modular, low-latency engine core in `semantic_server/`:
 
 Sub-second up to 100K entities. Writes are O(1) appends.
 
-| Operation                | Complexity | Notes                               |
-| ------------------------ | ---------- | ----------------------------------- |
-| `semantic_search_memory` | O(k)       | Postings index; heap-based top-k    |
-| `traverse_relations`     | O(V+E)     | Cached adjacency lists              |
-| `create_entities`        | O(1)       | Append-only JSONL with flock        |
-| `delete_entities`        | O(n)       | Must rewrite graph; locked + atomic |
-| `maintenance`            | O(n log n) | Sorted-merge consolidation          |
+| Operation      | Complexity | Notes                               |
+| -------------- | ---------- | ----------------------------------- |
+| `mem search`   | O(k)       | Postings index; heap-based top-k    |
+| `mem recall`   | O(V+E)     | Cached adjacency lists              |
+| `mem write`    | O(1)       | Append-only JSONL with flock        |
+| `mem remove`   | O(n)       | Must rewrite graph; locked + atomic |
+| `maintenance`  | O(n log n) | Sorted-merge consolidation          |
 
 ### a. Hard Limits
 
@@ -342,7 +344,7 @@ Sub-second up to 100K entities. Writes are O(1) appends.
 | Entities       | 100K                         |
 | Combined cache | 50 MB                        |
 | Recall entries | 10K LRU                      |
-| Obs/entity     | 50 activity-log / 200 others |
+| Obs/entity     | 20 cached                    |
 | BFS depth      | 10K nodes                    |
 
 ---
@@ -367,12 +369,12 @@ Sub-second up to 100K entities. Writes are O(1) appends.
 | Tools missing         | Re-run `install.sh`                                                   |
 | Search empty          | Rebuild index: `mem rebuild`                                          |
 | Graph too large       | Raise `decay_threshold` or run maintenance                            |
-| Agent asks permission | Re-run `setup-project.sh` — needs "Mandatory behavior" in `CLAUDE.md` |
+| Agent asks permission | Re-run `setup-project.sh` — checks CLAUDE.md bridge instructions      |
 | Maintenance stuck     | Delete `.memory/.last-maintenance`                                    |
 
 ### b. Known Limitations
 
-- **TF-IDF, not embeddings** — lexical similarity only. Porter stemming handled variants.
+- **TF-IDF, not embeddings** — lexical similarity only. Porter stemming handles variants.
 - **No read locking** — reads during maintenance may see partial data. Self-corrects.
 - **ASCII name splitting** — CJK/non-Latin merges on exact match only.
 - **Single machine** — export/import for cross-machine sync.

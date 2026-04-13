@@ -56,5 +56,5 @@ echo "To enable persistent knowledge graph memory, run:"
 echo "  '${SETUP_CMD}' '${CLAUDE_PROJECT_DIR}'"
 echo ""
 echo "This adds a .memory/ directory (gitignored) with a CLI bridge"
-echo "for keyword + semantic search across conversations."
+echo "for keyword search across conversations."
 exit 0
