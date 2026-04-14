@@ -1,5 +1,7 @@
 """Cache infrastructure: mtime-based caches with size-aware eviction."""
 
+from sys import getsizeof
+
 from .config import MAX_CACHE_BYTES
 
 index_cache = {
@@ -18,6 +20,9 @@ adjacency_cache = {
 }
 
 last_index_check = 0.0
+
+_DEPTH_CAP = 3
+_STRING_OVERHEAD = 49  # CPython str header
 
 
 def clear_index_cache():
@@ -43,15 +48,32 @@ def clear_relation_cache():
     )
 
 
-def estimate_size(obj):
-    """Estimate byte size via entry count * avg overhead."""
+def estimate_size(obj, _depth=0):
+    """Estimate byte size via shallow walk of strings/containers.
+
+    Traverses up to _DEPTH_CAP levels deep to price string payloads
+    accurately. Past the cap, falls back to sys.getsizeof for speed.
+    """
     if obj is None:
         return 0
+    if _depth >= _DEPTH_CAP:
+        return getsizeof(obj)
+    if isinstance(obj, str):
+        return _STRING_OVERHEAD + len(obj)
+    if isinstance(obj, (int, float, bool)):
+        return getsizeof(obj)
     if isinstance(obj, dict):
-        return len(obj) * 2000
-    if isinstance(obj, list):
-        return len(obj) * 200
-    return 64
+        total = getsizeof(obj)
+        for k, v in obj.items():
+            total += estimate_size(k, _depth + 1)
+            total += estimate_size(v, _depth + 1)
+        return total
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        total = getsizeof(obj)
+        for item in obj:
+            total += estimate_size(item, _depth + 1)
+        return total
+    return getsizeof(obj)
 
 
 def _cache_total():

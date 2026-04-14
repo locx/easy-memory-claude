@@ -4,10 +4,11 @@ Extracted from maintenance.py to reduce bloat.
 """
 import json
 import math
+import sys
 import time
 import os
 from datetime import datetime, timedelta, timezone
-from .text import normalize_name
+from .text import normalize_name, normalize_type
 
 # Configuration defaults (mirrored or passed from maintenance)
 _GUARD_AGE_DAYS = 7
@@ -138,7 +139,7 @@ def consolidate(entities, relations, min_merge_name_len=4):
     keyed = []
     for i, e in enumerate(entities):
         norm = normalize_name(e.get("name", ""))
-        etype = e.get("entityType", "")
+        etype = normalize_type(e.get("entityType", ""))
         keyed.append((etype, norm, i))
 
     keyed.sort()

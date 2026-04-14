@@ -16,11 +16,11 @@ from .config import (
     RECALL_FLUSH_INTERVAL,
     SERVER_NAME,
     SERVER_VERSION,
-    init_branch,
     refresh_branch,
     log_event,
     session_stats,
 )
+from .bootstrap import bootstrap
 from .cache import index_cache
 from .graph import (
     load_index,
@@ -156,24 +156,8 @@ def main():
         os.path.join(os.getcwd(), ".memory"),
     )
 
-    if not os.path.isdir(memory_dir):
-        try:
-            os.makedirs(memory_dir, exist_ok=True)
-            sys.stderr.write(
-                f"{SERVER_NAME}: created MEMORY_DIR "
-                f"'{memory_dir}'\n"
-            )
-        except OSError as exc:
-            sys.stderr.write(
-                f"{SERVER_NAME}: warning: MEMORY_DIR "
-                f"'{memory_dir}' does not exist and "
-                f"could not be created: {exc}\n"
-            )
-        sys.stderr.flush()
-
-    # MEMORY_DIR convention: <project>/.memory
-    project_dir = os.path.dirname(memory_dir)
-    init_branch(project_dir)
+    bootstrap(memory_dir, load_index_on_start=False)
+    sys.stderr.flush()
 
     atexit.register(flush_recall_counts)
 

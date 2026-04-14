@@ -30,6 +30,12 @@ def init_recall_state(memory_dir):
     recall_path = os.path.join(
         memory_dir, "recall_counts.json"
     )
+    # Sweep orphaned .tmp from prior crash
+    tmp_path = recall_path + ".tmp"
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
     with _recall_lock:
         try:
             recall_mtime = os.path.getmtime(recall_path)

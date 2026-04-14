@@ -33,75 +33,64 @@ with _res.files(__package__).joinpath(
     TOOLS = json.load(_f)
 
 
+# Tool dispatch: each handler is (args, memory_dir) -> result
+_TOOL_HANDLERS = {
+    "semantic_search_memory": lambda a, md: search(
+        a.get("query", ""), md,
+        a.get("top_k", 5),
+        branch=a.get("branch"),
+    ),
+    "traverse_relations": lambda a, md: traverse_relations(
+        a.get("entity", ""), md,
+        a.get("direction", "both"),
+        a.get("max_depth", 2),
+    ),
+    "search_memory_by_time": lambda a, md: search_by_time(
+        md,
+        a.get("since"), a.get("until"),
+        a.get("limit", 20),
+        branch_filter=a.get("branch_filter"),
+        entity_type=a.get("entity_type"),
+    ),
+    "create_entities": lambda a, md: create_entities(
+        a.get("entities", []), md,
+    ),
+    "create_relations": lambda a, md: create_relations(
+        a.get("relations", []), md,
+    ),
+    "add_observations": lambda a, md: add_observations(
+        a.get("entity", ""),
+        a.get("observations", []),
+        md,
+    ),
+    "delete_entities": lambda a, md: delete_entities(
+        a.get("entity_names", []), md,
+    ),
+    "create_decision": lambda a, md: create_decision(a, md),
+    "update_decision_outcome": lambda a, md:
+        update_decision_outcome(a, md),
+    "list_decisions": lambda a, md: list_decisions(
+        md, stale_days=a.get("stale_days"),
+    ),
+    "remove_observations": lambda a, md: remove_observations(
+        a.get("entity", ""),
+        a.get("observations", []),
+        md,
+    ),
+    "rename_entity": lambda a, md: rename_entity(
+        a.get("old_name", ""),
+        a.get("new_name", ""),
+        md,
+    ),
+    "graph_stats": lambda a, md: graph_stats(md),
+}
+
+
 def _dispatch_tool_call(tool_name, args, memory_dir):
-    if tool_name == "semantic_search_memory":
-        return search(
-            args.get("query", ""),
-            memory_dir,
-            args.get("top_k", 5),
-            branch=args.get("branch"),
-        )
-    if tool_name == "traverse_relations":
-        return traverse_relations(
-            args.get("entity", ""),
-            memory_dir,
-            args.get("direction", "both"),
-            args.get("max_depth", 2),
-        )
-    if tool_name == "search_memory_by_time":
-        return search_by_time(
-            memory_dir,
-            args.get("since"),
-            args.get("until"),
-            args.get("limit", 20),
-            branch_filter=args.get("branch_filter"),
-            entity_type=args.get("entity_type"),
-        )
-    if tool_name == "create_entities":
-        return create_entities(
-            args.get("entities", []),
-            memory_dir,
-        )
-    if tool_name == "create_relations":
-        return create_relations(
-            args.get("relations", []),
-            memory_dir,
-        )
-    if tool_name == "add_observations":
-        return add_observations(
-            args.get("entity", ""),
-            args.get("observations", []),
-            memory_dir,
-        )
-    if tool_name == "delete_entities":
-        return delete_entities(
-            args.get("entity_names", []),
-            memory_dir,
-        )
-    if tool_name == "create_decision":
-        return create_decision(args, memory_dir)
-    if tool_name == "update_decision_outcome":
-        return update_decision_outcome(args, memory_dir)
-    if tool_name == "list_decisions":
-        return list_decisions(
-            memory_dir,
-            stale_days=args.get("stale_days"),
-        )
-    if tool_name == "remove_observations":
-        return remove_observations(
-            args.get("entity", ""),
-            args.get("observations", []),
-            memory_dir,
-        )
-    if tool_name == "rename_entity":
-        return rename_entity(
-            args.get("old_name", ""),
-            args.get("new_name", ""),
-            memory_dir,
-        )
-    if tool_name == "graph_stats":
-        return graph_stats(memory_dir)
-    return None
+    handler = _TOOL_HANDLERS.get(tool_name)
+    if handler is None:
+        return None
+    return handler(args, memory_dir)
 
 
 def handle_message(msg, memory_dir):

@@ -30,21 +30,30 @@ from .graph import (
     load_graph_relations,
     rewrite_graph,
 )
+from .text import normalize_name, normalize_type
 
 _DECISION_PREFIX = "decision: "
 
 
-def _find_similar_entity(name, existing_entities):
-    """Check for existing entity with similar normalized name."""
-    from .text import normalize_name
+def _build_norm_index(existing_entities):
+    """Pre-compute {normalized_name: original_name} for O(1) fuzzy lookup."""
+    index = {}
+    for name in existing_entities:
+        norm = normalize_name(name)
+        if norm and len(norm) >= 3:
+            # Keep first occurrence on collision
+            index.setdefault(norm, name)
+    return index
+
+
+def _find_similar_entity(name, norm_index):
+    """O(1) fuzzy lookup against pre-computed normalized index."""
     norm = normalize_name(name)
     if not norm or len(norm) < 3:
         return None
-    for existing_name in existing_entities:
-        if existing_name == name:
-            continue
-        if normalize_name(existing_name) == norm:
-            return existing_name
+    existing = norm_index.get(norm)
+    if existing and existing != name:
+        return existing
     return None
 
 
@@ -74,10 +83,7 @@ def create_entities(entities_input, memory_dir):
         name = name.strip()
         if not name:
             continue
-        etype = ent.get("entityType", "")
-        if not isinstance(etype, str):
-            etype = str(etype)
-        etype = etype.lower()
+        etype = normalize_type(ent.get("entityType", ""))
         obs = ent.get("observations", [])
         if not isinstance(obs, list):
             obs = [str(obs)]
@@ -102,14 +108,15 @@ def create_entities(entities_input, memory_dir):
             "message": "No valid entities",
         }
 
-    # Fuzzy match: warn about similar existing entities
+    # Fuzzy match: pre-normalize once, then O(1) lookups
     existing = load_graph_entities(memory_dir)
+    norm_index = _build_norm_index(existing)
     similar_warnings = []
     for entry in new_entries:
         name = entry["name"]
         if name in existing:
             continue
-        similar = _find_similar_entity(name, existing)
+        similar = _find_similar_entity(name, norm_index)
         if similar:
             similar_warnings.append(
                 f"'{name}' similar to existing "
@@ -235,8 +242,12 @@ def _detect_contradictions(new_obs, existing_obs):
     return conflicts
 
 
-def add_observations(entity_name, observations, memory_dir):
-    """Add observations to an existing entity."""
+def add_observations(entity_name, observations, memory_dir,
+                     _retry=False):
+    """Add observations to an existing entity.
+
+    Mtime guard detects concurrent writes — retries once.
+    """
     if not isinstance(entity_name, str) \
             or not entity_name:
         return {"error": "entity name required"}
@@ -262,6 +273,12 @@ def add_observations(entity_name, observations, memory_dir):
         }
 
     now = now_iso()
+
+    graph_path = os.path.join(memory_dir, "graph.jsonl")
+    try:
+        pre_mtime = os.path.getmtime(graph_path)
+    except OSError:
+        pre_mtime = 0.0
 
     # Must use load_graph_entities (not raw cache) for
     # cache coherence after create_entities in same session
@@ -290,6 +307,18 @@ def add_observations(entity_name, observations, memory_dir):
     etype = info.get("entityType", "")
     created = info.get("_created", now)
     conflicts = _detect_contradictions(new_obs, info.get("observations", []))
+
+    # Check for concurrent delete/update between read and write
+    try:
+        post_mtime = os.path.getmtime(graph_path)
+    except OSError:
+        post_mtime = 0.0
+    if post_mtime != pre_mtime and not _retry:
+        invalidate_caches()
+        return add_observations(
+            entity_name, observations, memory_dir,
+            _retry=True,
+        )
 
     if not append_jsonl(memory_dir, [{
         "type": "entity",
@@ -396,21 +425,21 @@ def _build_decision_obs(args):
     """Cleanly extract strings into an observation list for decisions."""
     rationale = args.get("rationale", "")
     obs = [f"Rationale: {rationale[:MAX_OBS_LENGTH]}"]
-    
+
     alts = args.get("alternatives", [])
     if isinstance(alts, list):
         for alt in alts[:10]:
             if isinstance(alt, str) and alt.strip():
                 obs.append(f"Alternative rejected: {alt[:MAX_OBS_LENGTH]}")
-                
+
     scope = args.get("scope", "")
     if isinstance(scope, str) and scope.strip():
         obs.append(f"Scope: {scope[:MAX_OBS_LENGTH]}")
-        
+
     chosen = args.get("chosen", "")
     if isinstance(chosen, str) and chosen.strip():
         obs.append(f"Chosen: {chosen[:MAX_OBS_LENGTH]}")
-        
+
     outcome = args.get("outcome", "pending")
     if outcome not in (
         "pending", "successful", "failed", "revised",
@@ -561,7 +590,7 @@ def graph_stats(memory_dir):
     relations = load_graph_relations(memory_dir)
 
     type_counts = Counter(
-        info.get("entityType", "unknown")
+        normalize_type(info.get("entityType", "unknown")) or "unknown"
         for info in entities.values()
     )
 
@@ -735,7 +764,12 @@ def remove_observations(entity_name, observations,
 
 
 def rename_entity(old_name, new_name, memory_dir):
-    """Rename an entity, updating all relation references."""
+    """Rename an entity, updating all relation references.
+
+    Drops self-loops and dedups duplicate (from, to, type) edges
+    that can arise when both old_name and new_name appear in the
+    same relation.
+    """
     if not old_name or not new_name:
         return {"error": "old_name and new_name required"}
     if old_name == new_name:
@@ -758,15 +792,29 @@ def rename_entity(old_name, new_name, memory_dir):
 
     rels = load_graph_relations(memory_dir)
     fixed_rels = []
+    seen_rels = set()
+    dropped_self_loops = 0
+    dropped_dups = 0
+    relations_updated = 0
     for r in rels:
-        fr = new_name if r.get("from") == old_name \
-            else r.get("from", "")
-        to = new_name if r.get("to") == old_name \
-            else r.get("to", "")
+        orig_fr = r.get("from", "")
+        orig_to = r.get("to", "")
+        fr = new_name if orig_fr == old_name else orig_fr
+        to = new_name if orig_to == old_name else orig_to
+        if fr == to:
+            dropped_self_loops += 1
+            continue
+        rt = r.get("relationType", "")
+        key = (fr, to, rt)
+        if key in seen_rels:
+            dropped_dups += 1
+            continue
+        seen_rels.add(key)
         fixed_rels.append({
-            "from": fr, "to": to,
-            "relationType": r.get("relationType", ""),
+            "from": fr, "to": to, "relationType": rt,
         })
+        if orig_fr == old_name or orig_to == old_name:
+            relations_updated += 1
 
     try:
         rewrite_graph(memory_dir, updated, fixed_rels)
@@ -775,8 +823,13 @@ def rename_entity(old_name, new_name, memory_dir):
     # rewrite_graph already calls invalidate_caches()
     log_event("RENAME",
               f'"{old_name}" -> "{new_name}"')
-    return {"renamed": old_name, "to": new_name,
-            "relations_updated": len(
-                [r for r in rels
-                 if r.get("from") == old_name
-                 or r.get("to") == old_name])}
+    resp = {
+        "renamed": old_name,
+        "to": new_name,
+        "relations_updated": relations_updated,
+    }
+    if dropped_self_loops:
+        resp["self_loops_removed"] = dropped_self_loops
+    if dropped_dups:
+        resp["duplicate_relations_merged"] = dropped_dups
+    return resp

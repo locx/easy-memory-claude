@@ -32,6 +32,7 @@ from .cache import (
     estimate_size,
     maybe_evict_caches,
 )
+from .text import normalize_type
 
 
 def _obs_dedup_key(obs):
@@ -42,7 +43,10 @@ def _obs_dedup_key(obs):
 
 
 def _merge_obs(prev_obs, new_obs, seen=None):
-    """Merge new_obs into prev_obs with dedup + truncate."""
+    """Merge new_obs into prev_obs with dedup + truncate.
+
+    Returns the updated seen-set; caller may cache for reuse.
+    """
     if seen is None:
         seen = {_obs_dedup_key(o) for o in prev_obs}
     for o in new_obs:
@@ -108,7 +112,13 @@ def _iter_graph_lines(f, start_offset, max_incr_bytes, deadline):
         yield line, end_offset
 
 
-def _handle_entity_entry(entities, obj):
+def _handle_entity_entry(entities, obs_keys, obj):
+    """Parse one entity JSONL entry.
+
+    obs_keys is a sidecar {name: set(dedup_keys)} used for fast
+    dedup-merge across appends. Kept out of the entity dict so the
+    data model stays clean.
+    """
     name = obj.get("name", "")
     if isinstance(name, str):
         name = name.strip()
@@ -121,10 +131,10 @@ def _handle_entity_entry(entities, obj):
         obs = []
     if name in entities:
         prev = entities[name]
-        prev["_obs_keys"] = _merge_obs(
+        obs_keys[name] = _merge_obs(
             prev.get("observations", []),
             obs,
-            prev.get("_obs_keys"),
+            obs_keys.get(name),
         )
         _merge_ts(
             prev,
@@ -139,7 +149,7 @@ def _handle_entity_entry(entities, obj):
         if len(obs_list) > MAX_CACHED_OBS:
             obs_list = obs_list[-MAX_CACHED_OBS:]
         info = {
-            "entityType": obj.get("entityType", "").lower(),
+            "entityType": normalize_type(obj.get("entityType", "")),
             "observations": obs_list,
             "_created": _norm_ts(obj.get("_created", "")),
             "_updated": _norm_ts(obj.get("_updated", "")),
@@ -148,6 +158,7 @@ def _handle_entity_entry(entities, obj):
         if branch:
             info["_branch"] = branch
         entities[name] = info
+        obs_keys[name] = {_obs_dedup_key(o) for o in obs_list}
 
 
 def _handle_relation_entry(relations, rel_seen, obj):
@@ -165,11 +176,16 @@ def _handle_relation_entry(relations, rel_seen, obj):
             "relationType": r_type,
         })
 
-def _parse_graph_file(graph_path, start_offset=0):
-    """Parse graph.jsonl into (entities_dict, relations_list)."""
+def _parse_graph_file(graph_path, start_offset=0, seed_obs_keys=None):
+    """Parse graph.jsonl into (entities_dict, relations_list, obs_keys, end_offset).
+
+    seed_obs_keys lets the incremental path reuse a prior dedup set,
+    avoiding O(M) rebuilds per entity.
+    """
     entities = {}
     relations = []
     rel_seen = set()
+    obs_keys = dict(seed_obs_keys) if seed_obs_keys else {}
     deadline = time.monotonic() + PARSE_TIME_BUDGET
     end_offset = start_offset
     max_incr_bytes = MAX_GRAPH_BYTES if start_offset == 0 \
@@ -186,22 +202,24 @@ def _parse_graph_file(graph_path, start_offset=0):
                         continue
                     t = obj.get("type")
                     if t == "entity":
-                        _handle_entity_entry(entities, obj)
+                        _handle_entity_entry(entities, obs_keys, obj)
                     elif t == "relation":
                         _handle_relation_entry(relations, rel_seen, obj)
                 except (json.JSONDecodeError, ValueError):
                     continue
     except OSError:
-        return None, None, 0
-    for info in entities.values():
-        info.pop("_obs_keys", None)
-    return entities, relations, end_offset
+        return None, None, None, 0
+    # Trim obs_keys to entities actually present
+    for name in list(obs_keys):
+        if name not in entities:
+            obs_keys.pop(name, None)
+    return entities, relations, obs_keys, end_offset
 
 
 
 def _do_full_parse(graph_path, mtime):
     """Full graph parse — populates both caches."""
-    entities, relations, offset = _parse_graph_file(graph_path)
+    entities, relations, obs_keys, offset = _parse_graph_file(graph_path)
     if entities is None:
         clear_entity_cache()
         clear_relation_cache()
@@ -213,6 +231,7 @@ def _do_full_parse(graph_path, mtime):
     entity_cache["size"] = estimate_size(entities)
     entity_cache["offset"] = offset
     entity_cache["append_only"] = False
+    entity_cache["obs_keys"] = obs_keys
     entity_cache.pop("_pre_invalidate_mtime", None)
     relation_cache["data"] = relations
     relation_cache["mtime"] = mtime
@@ -253,14 +272,26 @@ def load_index(memory_dir):
         return None
 
 
-def _merge_incremental_data(existing_ents, new_ents, new_rels):
+def _merge_incremental_data(existing_ents, existing_obs_keys,
+                            new_ents, new_obs_keys, new_rels):
+    """Merge incremental parse results into cache, reusing dedup sets."""
     for name, info in new_ents.items():
         if name in existing_ents:
             prev = existing_ents[name]
-            _merge_obs(prev["observations"], info.get("observations", []))
+            seen = existing_obs_keys.get(name)
+            existing_obs_keys[name] = _merge_obs(
+                prev["observations"],
+                info.get("observations", []),
+                seen,
+            )
             _merge_ts(prev, info.get("_created", ""), info.get("_updated", ""))
         else:
             existing_ents[name] = info
+            # Reuse obs_keys produced by parser when available
+            existing_obs_keys[name] = (
+                new_obs_keys.get(name)
+                or {_obs_dedup_key(o) for o in info.get("observations", [])}
+            )
 
     if relation_cache["data"] is not None and new_rels:
         existing_keys = {
@@ -303,23 +334,32 @@ def load_graph_entities(memory_dir):
             # mtime unchanged since invalidation — force full parse
             entity_cache["append_only"] = False
         else:
-            new_ents, new_rels, offset = _parse_graph_file(
-                graph_path, start_offset=prev_offset
+            existing_obs_keys = entity_cache.get("obs_keys") or {}
+            new_ents, new_rels, new_obs_keys, offset = _parse_graph_file(
+                graph_path, start_offset=prev_offset,
             )
             if new_ents is None:
                 entity_cache["append_only"] = False
                 entity_cache.pop("_pre_invalidate_mtime", None)
             else:
                 existing = entity_cache["data"]
-                _merge_incremental_data(existing, new_ents, new_rels)
+                _merge_incremental_data(
+                    existing, existing_obs_keys,
+                    new_ents, new_obs_keys or {}, new_rels,
+                )
                 entity_cache["mtime"] = mtime
                 entity_cache["offset"] = offset
                 entity_cache["size"] = estimate_size(existing)
                 entity_cache["append_only"] = False
+                entity_cache["obs_keys"] = existing_obs_keys
                 entity_cache.pop("_pre_invalidate_mtime", None)
                 if relation_cache["data"] is not None:
                     relation_cache["mtime"] = mtime
-                adjacency_cache.update(outbound=None, inbound=None, mtime=0.0)
+                # Only invalidate adjacency if relations actually changed
+                if new_rels:
+                    adjacency_cache.update(
+                        outbound=None, inbound=None, mtime=0.0,
+                    )
                 maybe_evict_caches()
                 return existing
 
@@ -425,7 +465,7 @@ def invalidate_entity_cache_only():
 
 
 def invalidate_relation_cache_only():
-    """Invalidate relation + adjacency caches only."""
+    """Invalidate relation cache (adjacency handled separately)."""
     clear_relation_cache()
 
 

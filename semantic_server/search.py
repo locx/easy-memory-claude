@@ -33,6 +33,7 @@ try:
         STOPWORDS as _STOPWORDS,
         filter_token as _filter_token,
         load_aliases,
+        normalize_type,
     )
     _HAS_STEMMING = True
 except ImportError:
@@ -58,6 +59,11 @@ except ImportError:
 
     def _filter_token(w):
         return len(w) >= 2
+
+    def normalize_type(etype):
+        if not isinstance(etype, str):
+            etype = str(etype)
+        return etype.lower().strip()
 
 # Alias cache: reload when aliases.json mtime changes
 _alias_cache = {"map": None, "mtime": 0.0, "dir": ""}
@@ -109,7 +115,7 @@ def _enrich_results(results, source, max_obs=MAX_CACHED_OBS):
         info = source.get(r["entity"], {})
         if info:
             obs = info.get("observations")
-            r["entityType"] = info.get("entityType", "")
+            r["entityType"] = normalize_type(info.get("entityType", ""))
             r["_branch"] = info.get("_branch", "")
             r["observations"] = obs[:max_obs] if isinstance(obs, list) else []
 
@@ -132,20 +138,22 @@ def _build_query_vector(query, idf, alias_map=None):
 def _get_candidates(query_keys, postings, vectors):
     if not postings:
         return set(vectors.keys())
-    p_lists = [set(postings[w]) for w in query_keys if w in postings]
-    p_lists.sort(key=len)
-    if len(p_lists) >= 2:
-        candidates = p_lists[0] & p_lists[1]
-        if not candidates:
-            # Fallback to union up to MAX_CANDIDATES
-            for pl in p_lists:
-                candidates |= pl
-                if len(candidates) >= MAX_CANDIDATES:
-                    break
-        return candidates
-    elif p_lists:
-        return p_lists[0]
-    return set()
+    # Sort postings smallest-first and intersect incrementally
+    # for early short-circuit on broad queries
+    relevant = [postings[w] for w in query_keys if w in postings]
+    relevant.sort(key=len)
+    if not relevant:
+        return set()
+    if len(relevant) == 1:
+        return set(relevant[0])
+    candidates = set(relevant[0]) & set(relevant[1])
+    if not candidates:
+        # Fallback to union up to MAX_CANDIDATES
+        for pl in relevant:
+            candidates |= set(pl)
+            if len(candidates) >= MAX_CANDIDATES:
+                break
+    return candidates
 
 
 def _score_candidates(query_vec, mag_q, candidates, vectors, magnitudes, metadata, current_branch, top_k):
@@ -193,7 +201,9 @@ def _format_results(results, compact, metadata, memory_dir):
         _enrich_results(results, source, min(5, MAX_CACHED_OBS))
     else:
         for r in results:
-            r["entityType"] = metadata.get(r["entity"], {}).get("entityType", "")
+            r["entityType"] = normalize_type(
+                metadata.get(r["entity"], {}).get("entityType", "")
+            )
 
 
 def search(query, memory_dir, top_k=5, branch=None, compact=False):
@@ -251,6 +261,8 @@ def search_by_time(memory_dir, since=None, until=None, limit=20, branch_filter=N
     since_n = _normalize_iso_ts(since) if since else None
     until_n = _normalize_iso_ts(until) if until else None
 
+    target_type = normalize_type(entity_type) if entity_type else None
+
     candidates = []
     for name, info in entities.items():
         ts = info.get("_updated") or info.get("_created", "")
@@ -258,7 +270,7 @@ def search_by_time(memory_dir, since=None, until=None, limit=20, branch_filter=N
         if since_n and ts < since_n: continue
         if until_n and ts > until_n: continue
         if branch_filter and info.get("_branch", "") != branch_filter: continue
-        if entity_type and info.get("entityType", "") != entity_type: continue
+        if target_type and normalize_type(info.get("entityType", "")) != target_type: continue
         candidates.append((ts, name))
 
     total_matched = len(candidates)
@@ -270,7 +282,7 @@ def search_by_time(memory_dir, since=None, until=None, limit=20, branch_filter=N
         obs = info.get("observations")
         results.append({
             "entity": name,
-            "entityType": info.get("entityType", ""),
+            "entityType": normalize_type(info.get("entityType", "")),
             "updated": ts,
             "created": info.get("_created", ""),
             "_branch": info.get("_branch", ""),

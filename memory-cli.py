@@ -762,30 +762,22 @@ def main():
     tool_args = _parse_tool_args(tool_name, extra_args)
 
     # --- Auto-Init ---
-    if not os.path.isdir(memory_dir):
-        try:
-            os.makedirs(memory_dir, exist_ok=True)
-            # "a" mode creates if not exists, no-op if exists
-            with open(os.path.join(memory_dir, "graph.jsonl"), "a"):
-                pass
-            if sys.stdout.isatty():
-                print(
-                    f"Initialized knowledge graph at "
-                    f"{memory_dir}",
-                    file=sys.stderr,
-                )
-        except OSError as exc:
-            print(
-                f"Error: Could not initialize "
-                f"MEMORY_DIR {memory_dir}: {exc}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    was_missing = not os.path.isdir(memory_dir)
 
-    # Init branch detection (project_dir = parent of .memory)
-    from semantic_server.config import init_branch
-    project_dir = os.path.dirname(memory_dir)
-    init_branch(project_dir)
+    # Shared bootstrap: ensure dir, init branch + recall + index
+    from semantic_server.bootstrap import bootstrap
+    if not bootstrap(memory_dir, load_index_on_start=False):
+        print(
+            f"Error: Could not initialize MEMORY_DIR {memory_dir}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if was_missing and sys.stdout.isatty():
+        print(
+            f"Initialized knowledge graph at {memory_dir}",
+            file=sys.stderr,
+        )
 
     # Merge pending sidecar before any reads
     _merge_pending(memory_dir)
@@ -810,17 +802,13 @@ def main():
 
     # --- Commands that need semantic_server ---
     from semantic_server.graph import load_index
-    from semantic_server.recall import (
-        init_recall_state,
-        flush_recall_counts,
-    )
+    from semantic_server.recall import flush_recall_counts
 
     try:
         load_index(memory_dir)
-        init_recall_state(memory_dir)
     except Exception as exc:
         print(
-            f"Warning: index init failed ({exc}), "
+            f"Warning: index load failed ({exc}), "
             f"search may be degraded",
             file=sys.stderr,
         )

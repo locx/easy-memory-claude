@@ -9,6 +9,7 @@ from .graph import (
     load_graph_entities,
     load_graph_relations,
 )
+from .text import normalize_type
 
 _MAX_VISITED = 10_000
 
@@ -128,7 +129,7 @@ def traverse_relations(entity, memory_dir,
         info = entities.get(name, {})
         nodes.append({
             "name": name,
-            "entityType": info.get("entityType", ""),
+            "entityType": normalize_type(info.get("entityType", "")),
             "observations": info.get("observations", [])[:3],
         })
 

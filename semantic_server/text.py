@@ -82,6 +82,12 @@ def normalize_name(name):
     name = _RE_CAMEL.sub(r'\1 \2', name)
     return _RE_SEPS.sub(' ', name.lower().strip())
 
+def normalize_type(etype):
+    """Normalize entityType for consistent comparison/storage."""
+    if not isinstance(etype, str):
+        etype = str(etype)
+    return etype.lower().strip()
+
 def make_bigrams(tokens):
     """Generate underscore-joined bigrams from token list."""
     return [tokens[i] + '_' + tokens[i + 1] for i in range(len(tokens) - 1)]
