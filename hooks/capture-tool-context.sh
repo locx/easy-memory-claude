@@ -8,9 +8,11 @@
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] || exit 0
 
 # VSCode extension runs hooks but discards output — skip entirely
-[ -z "${VSCODE_PID:-}" ] && [ -z "${VSCODE_IPC_HOOK:-}" ] \
-    && [ "${TERM_PROGRAM:-}" != "vscode" ] \
-    || exit 0
+# Exit when VSCode IS running; run otherwise.
+if [ -n "${VSCODE_PID:-}" ] || [ -n "${VSCODE_IPC_HOOK:-}" ] \
+        || [ "${TERM_PROGRAM:-}" = "vscode" ]; then
+    exit 0
+fi
 
 [ -d "${CLAUDE_PROJECT_DIR}/.memory" ] || exit 0
 [ -n "${CLAUDE_SESSION_ID:-}" ] || exit 0
@@ -29,6 +31,9 @@ _file_mtime() {
         || python3 -c "import os,sys; print(int(os.path.getmtime(sys.argv[1])))" "$1" 2>/dev/null \
         || echo 0
 }
+
+# Clean up stale toolcap temp files older than 1 hour
+find /tmp -maxdepth 1 -name '.claude-toolcap-*' -mmin +60 -delete 2>/dev/null || true
 
 # Throttle: skip if last capture was <30s ago
 MARKER="/tmp/.claude-mem-toolcap-${SAFE_SID}"

@@ -66,25 +66,24 @@ sep = (',', ':')
 tmp = output_path + '.tmp'
 try:
     with open(tmp, 'w', encoding='utf-8') as out:
-        # Write header
-        header = {
-            'format': 'easy-memory-claude-export',
-            'version': 1,
-            'exported': time.strftime(
-                '%Y-%m-%dT%H:%M:%SZ', time.gmtime()
-            ),
-            'project': project_name,
-            'stats': {
-                'entities': entity_count,
-                'relations': relation_count,
-                'total_entries': total_count,
-            },
-        }
-        # Write everything except closing brace
-        header_json = json.dumps(header, indent=2)
-        # Remove trailing "}" and append entries array
-        out.write(header_json[:-1])
-        out.write(',\n  "entries": [\n')
+        # Write header as streaming fields (no slice hack)
+        out.write('{\n')
+        out.write('  "format": "easy-memory-claude-export",\n')
+        out.write('  "version": 1,\n')
+        out.write('  "exported": ')
+        json.dump(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), out)
+        out.write(',\n')
+        out.write('  "project": ')
+        json.dump(project_name, out)
+        out.write(',\n')
+        out.write('  "stats": ')
+        json.dump({
+            'entities': entity_count,
+            'relations': relation_count,
+            'total_entries': total_count,
+        }, out)
+        out.write(',\n')
+        out.write('  "entries": [\n')
 
         # Stream entries from graph
         first = True

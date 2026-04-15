@@ -1,5 +1,6 @@
 """MCP protocol: tool schemas and JSON-RPC 2.0 message handling."""
 import json
+import logging
 import sys
 
 from ._json import dumps as _fast_dumps
@@ -25,12 +26,34 @@ from .tools import (
 )
 from .traverse import traverse_relations
 
+_log = logging.getLogger(__name__)
+
 # Load tool schemas from external JSON (292L data, not code)
 import importlib.resources as _res
-with _res.files(__package__).joinpath(
-    "tools_schema.json"
-).open() as _f:
-    TOOLS = json.load(_f)
+try:
+    with _res.files(__package__).joinpath(
+        "tools_schema.json"
+    ).open() as _f:
+        TOOLS = json.load(_f)
+except Exception as _e:
+    sys.stderr.write(
+        f"[memory] warn: tools_schema.json load failed: {_e}\n"
+    )
+    TOOLS = []
+
+_index_loaded = False
+
+
+def _ensure_index(memory_dir):
+    global _index_loaded
+    if not _index_loaded:
+        try:
+            load_index(memory_dir)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[memory] warn: lazy index load failed: {exc}\n"
+            )
+        _index_loaded = True
 
 
 # Tool dispatch: each handler is (args, memory_dir) -> result
@@ -105,9 +128,10 @@ def handle_message(msg, memory_dir):
         params = {}
 
     if method == "initialize":
+        global _index_loaded
+        _index_loaded = False
         reset_session_stats()
         refresh_branch()
-        load_index(memory_dir)
         init_recall_state(memory_dir)
         log_event("INIT", "session started")
         return {
@@ -131,6 +155,7 @@ def handle_message(msg, memory_dir):
         }
 
     if method == "tools/call":
+        _ensure_index(memory_dir)
         tool_name = params.get("name", "")
         args = params.get("arguments") or {}
         if not isinstance(args, dict):
@@ -184,6 +209,7 @@ def handle_message(msg, memory_dir):
         }
 
     if method.startswith("notifications/"):
+        _log.debug("notifications ignored: %s", method)
         return None
 
     if msg_id is not None:

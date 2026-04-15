@@ -133,7 +133,7 @@
   },
   {
     "name": "create_relations",
-    "description": "Create directed edges between entities. Duplicates are silently skipped. Referenced entities that don't exist are auto-created as stubs. Use for: recording dependencies, call chains, ownership.",
+    "description": "Create directed edges between entities. Duplicates are silently skipped. Use for: recording dependencies, call chains, ownership.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -358,8 +358,14 @@
         "stale_days": {
           "type": "number",
           "description": "If set, return only pending decisions older than this many days"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max decisions to return (default 50)",
+          "default": 50
         }
-      }
+      },
+      "additionalProperties": false
     }
   },
   {

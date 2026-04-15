@@ -182,7 +182,10 @@ for entry in import_entries:
         else:
             skipped_r += 1
     else:
-        existing.append(entry)
+        sys.stderr.write(
+            f'  [warn] Skipping entry with unknown type {t!r}\n'
+        )
+        skipped_invalid += 1
 
 # Write merged graph atomically
 tmp = graph_path + '.tmp.import'

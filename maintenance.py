@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from itertools import chain
 from pathlib import Path
@@ -34,7 +35,7 @@ except ImportError:
         sep = kw.get("separators", (",", ":"))
         _json.dump(obj, f, separators=sep)
 
-from semantic_server.io_utils import iter_jsonl, partition_graph, write_jsonl
+from semantic_server.io_utils import iter_jsonl, partition_graph, write_jsonl, merge_pending
 from semantic_server.stem import stem_word as _stem
 from semantic_server.text import (
     STOPWORDS as _STOPWORDS,
@@ -257,6 +258,12 @@ def build_tfidf_index(entities, memory_dir):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, index_path)
+        # Clear dirty marker if present
+        dirty = os.path.join(memory_dir, ".index-dirty")
+        try:
+            os.unlink(dirty)
+        except OSError:
+            pass
     except BaseException:
         try:
             os.unlink(tmp)
@@ -327,10 +334,16 @@ def _print_graph_stats(entities, n_relations, pruned,
           f"index={idx_kb}KB")
 
 
+# P20: proper no-op context manager when fcntl unavailable
+@contextmanager
+def _noop_lock():
+    yield
+
+
 def _acquire_lock(memory_dir):
     """Acquire exclusive flock with 10s timeout. Returns fd or None."""
     if fcntl is None:
-        return True  # Windows: no locking, return truthy
+        return _noop_lock()  # Windows: no-op context manager
     lock_path = os.path.join(memory_dir, ".graph.lock")
     # DO NOT unlink stale lock files — flock is per-inode.
     # Unlinking + recreating gives a new inode, allowing
@@ -359,63 +372,17 @@ def _acquire_lock(memory_dir):
 
 def _release_lock(lock_fd):
     """Release maintenance lock safely."""
-    if lock_fd is not None and lock_fd is not True:
-        try:
-            if fcntl is not None:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
-        except OSError:
-            pass
-
-
-def _do_pending_merge(merging, graph_path):
-    """Append .merging file contents into graph.jsonl, then unlink it.
-
-    If append succeeds but unlink fails, truncate to
-    prevent re-appending the same data.
-    """
-    try:
-        with open(merging, "rb") as src:
-            data = src.read()
-        if not data:
-            os.unlink(merging)
-            return
-        if not data.endswith(b"\n"):
-            data += b"\n"
-        with open(graph_path, "ab") as dst:
-            dst.write(data)
-            dst.flush()
-            os.fsync(dst.fileno())
-        try:
-            os.unlink(merging)
-        except OSError:
-            try:
-                with open(merging, "w"):
-                    pass
-            except OSError:
-                pass
-    except OSError:
-        pass  # pre-append failure — orphan stays
-
-
-def _merge_pending_file(memory_dir, graph_path):
-    """Merge .pending sidecar into graph.jsonl.
-
-    Recovers orphaned .merging/.processing from crash.
-    """
-    pending = graph_path + ".pending"
-    merging = pending + ".merging"
-
-    # Only recover .merging — .processing is owned by
-    # the MCP server process (server.py)
-    if os.path.exists(merging):
-        _do_pending_merge(merging, graph_path)
-
-    try:
-        os.rename(pending, merging)
-    except OSError:
+    if lock_fd is None:
         return
-    _do_pending_merge(merging, graph_path)
+    # no-op context manager (Windows path) — nothing to release
+    if hasattr(lock_fd, '__exit__'):
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+    except OSError:
+        pass
 
 
 def _backup_graph(graph_path):
@@ -471,7 +438,6 @@ def run(project_dir):
     memory_dir = os.path.join(project_dir, ".memory")
     _load_config(memory_dir)
     graph_path = os.path.join(memory_dir, "graph.jsonl")
-    _merge_pending_file(memory_dir, graph_path)
     marker = os.path.join(memory_dir, ".last-maintenance")
 
     if not os.path.exists(graph_path):
@@ -482,39 +448,33 @@ def run(project_dir):
         if age_h < _cfg["THROTTLE_HOURS"]:
             return
 
-    if not _backup_graph(graph_path):
-        return
-
-    try:
-        entities, relations, others = partition_graph(graph_path)
-    except (OSError, MemoryError) as exc:
-        print(f"Maintenance: failed to load graph: {exc}")
-        return
-    if not entities and not relations and not others:
-        Path(marker).touch()
-        return
-
-    try:
-        pre_mtime = os.path.getmtime(graph_path)
-    except OSError:
-        pre_mtime = 0.0
-
-    entities, relations, pruned, merged, recall_counts = \
-        _compute_maintenance(entities, relations, project_dir, memory_dir)
-
+    # P3: acquire lock BEFORE partition to eliminate TOCTOU
     lock_fd = _acquire_lock(memory_dir)
     if lock_fd is None:
         print("Maintenance: skipped (another instance running)")
         return
 
     try:
-        try:
-            post_mtime = os.path.getmtime(graph_path)
-        except OSError:
-            post_mtime = 0.0
-        if post_mtime != pre_mtime:
-            print("Maintenance: graph modified during compute — skipping")
+        # Merge pending inside lock
+        mem_path = Path(memory_dir)
+        gp = mem_path / "graph.jsonl"
+        pending = mem_path / "graph.jsonl.pending"
+        merge_pending(mem_path, gp, pending, lock=None, invalidate_cb=None)
+
+        if not _backup_graph(graph_path):
             return
+
+        try:
+            entities, relations, others = partition_graph(graph_path)
+        except (OSError, MemoryError) as exc:
+            print(f"Maintenance: failed to load graph: {exc}")
+            return
+        if not entities and not relations and not others:
+            Path(marker).touch()
+            return
+
+        entities, relations, pruned, merged, recall_counts = \
+            _compute_maintenance(entities, relations, project_dir, memory_dir)
 
         write_jsonl(graph_path, chain(entities, relations, others))
         Path(marker).touch()
@@ -540,7 +500,16 @@ def rebuild_index(memory_dir):
     branch = get_branch(
         cwd=os.path.dirname(memory_dir)
     )
+    # P13: stamp_metadata mutates entities; write them back before indexing
     entities = stamp_metadata(entities, branch)
+    # Rewrite graph so stamped metadata is persisted
+    try:
+        all_ents, all_rels, all_others = partition_graph(graph_path)
+        stamped_names = {e.get("name", ""): e for e in entities}
+        merged_ents = [stamped_names.get(e.get("name", ""), e) for e in all_ents]
+        write_jsonl(graph_path, chain(merged_ents, all_rels, all_others))
+    except (OSError, MemoryError):
+        pass  # best-effort; still proceed to index
     index_input = [
         {"name": e.get("name", ""),
          "entityType": e.get("entityType", ""),

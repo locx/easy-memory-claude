@@ -29,9 +29,11 @@ find_root() {
     done
 
     # 2. Look for git root
-    if git rev-parse --show-toplevel 2>/dev/null; then
+    local _git_root
+    _git_root="$(git rev-parse --show-toplevel 2>/dev/null)" && {
+        echo "$_git_root"
         return
-    fi
+    }
 
     # 3. Look for common project markers upwards
     d="$PWD"

@@ -129,26 +129,22 @@ def _can_merge(ent_i, ent_j, norm_i, norm_j, len_i, len_j, guard_cutoff, min_mer
             return False
     return True
 
-def consolidate(entities, relations, min_merge_name_len=4):
-    """Merge entities with same type + overlapping names."""
-    if len(entities) > _MAX_CONSOLIDATE_ENTITIES:
-        return entities, relations, 0
 
-    guard_cutoff = (datetime.now(timezone.utc) - timedelta(days=_GUARD_AGE_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    n = len(entities)
-    keyed = []
-    for i, e in enumerate(entities):
-        norm = normalize_name(e.get("name", ""))
-        etype = normalize_type(e.get("entityType", ""))
-        keyed.append((etype, norm, i))
+def _find_merge_groups(entities, keyed, guard_cutoff, min_merge_name_len):
+    """O(n²) sliding-window comparison; returns (absorbed set, renames dict, merged_count).
 
-    keyed.sort()
-    merged_count = 0
+    Mutates entities in-place (merges observations into the surviving entity).
+    Respects _MAX_COMPARISONS cap; writes warning to stderr and breaks on cap.
+    """
+    _MAX_COMPARISONS = 500_000
+    n = len(keyed)
+    WINDOW = 20 if n < 5000 else 10
+
     absorbed = set()
     renames = {}
-    WINDOW = 20 if n < 5000 else 10
+    merged_count = 0
     total_comparisons = 0
-    _MAX_COMPARISONS = 500_000
+    cap_hit = False
 
     for pos in range(n):
         etype_i, norm_i, idx_i = keyed[pos]
@@ -162,6 +158,7 @@ def consolidate(entities, relations, min_merge_name_len=4):
         for ahead in range(1, WINDOW + 1):
             total_comparisons += 1
             if total_comparisons > _MAX_COMPARISONS:
+                cap_hit = True
                 break
             j = pos + ahead
             if j >= n:
@@ -174,19 +171,21 @@ def consolidate(entities, relations, min_merge_name_len=4):
 
             ent_j = entities[idx_j]
             len_j = len(norm_j)
-            if not _can_merge(ent_i, ent_j, norm_i, norm_j, len_i, len_j, guard_cutoff, min_merge_name_len):
+            if not _can_merge(ent_i, ent_j, norm_i, norm_j, len_i, len_j,
+                               guard_cutoff, min_merge_name_len):
                 continue
-            
+
             if obs_dict_i is None:
                 obs_dict_i = _safe_obs_dedup(ent_i.get("observations", []))
-                _seen_i = {(o if isinstance(o, str) else json.dumps(o, sort_keys=True)) for o in obs_dict_i}
-            
+                _seen_i = {(o if isinstance(o, str) else json.dumps(o, sort_keys=True))
+                           for o in obs_dict_i}
+
             for o in ent_j.get("observations", []):
                 key = (o if isinstance(o, str) else json.dumps(o, sort_keys=True))
                 if key not in _seen_i:
                     _seen_i.add(key)
                     obs_dict_i.append(o)
-            
+
             upd_j = ent_j.get("_updated", "")
             upd_i = ent_i.get("_updated", "")
             if upd_j and (not upd_i or upd_j > upd_i):
@@ -194,8 +193,8 @@ def consolidate(entities, relations, min_merge_name_len=4):
             absorbed.add(idx_j)
             renames[ent_j.get("name", "")] = ent_i.get("name", "")
             merged_count += 1
-        
-        if total_comparisons > _MAX_COMPARISONS:
+
+        if cap_hit:
             sys.stderr.write(
                 f"warn: consolidation cap reached after "
                 f"{merged_count} merges, remaining entities skipped\n"
@@ -204,16 +203,21 @@ def consolidate(entities, relations, min_merge_name_len=4):
         if obs_dict_i is not None:
             ent_i["observations"] = list(obs_dict_i)
 
-    kept = [e for i, e in enumerate(entities) if i not in absorbed]
+    return absorbed, renames, merged_count
 
-    # Cap observations
+
+def _apply_merges(entities, absorbed):
+    """Return surviving entities with capped observations."""
+    kept = [e for i, e in enumerate(entities) if i not in absorbed]
     for e in kept:
         obs = e.get("observations", [])
-        cap = 200
-        if len(obs) > cap:
-            e["observations"] = obs[-cap:]
+        if len(obs) > 200:
+            e["observations"] = obs[-200:]
+    return kept
 
-    # Resolve transitive renames
+
+def _rewrite_relations_post_merge(relations, renames):
+    """Resolve transitive renames, dedup, and rewrite relation from/to fields."""
     for k in list(renames):
         v = renames[k]
         while v in renames and renames[v] != v:
@@ -233,8 +237,31 @@ def consolidate(entities, relations, min_merge_name_len=4):
             if new_fr != fr or new_to != to:
                 r = dict(r, **{"from": new_fr, "to": new_to})
             updated_rels.append(r)
+    return updated_rels
+
+
+def consolidate(entities, relations, min_merge_name_len=4):
+    """Merge entities with same type + overlapping names."""
+    if len(entities) > _MAX_CONSOLIDATE_ENTITIES:
+        return entities, relations, 0
+
+    guard_cutoff = (datetime.now(timezone.utc) - timedelta(days=_GUARD_AGE_DAYS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    keyed = sorted(
+        [(normalize_type(e.get("entityType", "")), normalize_name(e.get("name", "")), i)
+         for i, e in enumerate(entities)]
+    )
+
+    absorbed, renames, merged_count = _find_merge_groups(
+        entities, keyed, guard_cutoff, min_merge_name_len
+    )
+    kept = _apply_merges(entities, absorbed)
+    updated_rels = _rewrite_relations_post_merge(relations, renames)
 
     return kept, updated_rels, merged_count
+
 
 def stamp_metadata(entities, branch):
     """Add _branch/_created to new entities."""

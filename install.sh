@@ -97,10 +97,14 @@ else
     read -r ans
     case "$ans" in
         [yY]|[yY][eE][sS])
-            if python3 -m pip install --user --quiet "orjson>=3.9" 2>/dev/null; then
+            _pip_out=$(python3 -m pip install --user "orjson>=3.9" 2>&1)
+            _pip_rc=$?
+            if [ $_pip_rc -eq 0 ]; then
                 echo "  [ok] orjson installed"
             else
-                echo "  [skip] pip install failed — continuing with stdlib json"
+                echo "  [warn] pip install failed (exit ${_pip_rc}) — continuing with stdlib json"
+                echo "         To install manually: python3 -m pip install --user 'orjson>=3.9'"
+                echo "         pip output: ${_pip_out}"
             fi
             ;;
         *)
@@ -181,71 +185,14 @@ SETEOF
     echo "  [ok] Created ${SETTINGS} with hooks"
 else
     # Merge memory hooks into existing settings (idempotent)
-    python3 - "${SETTINGS}" << 'PYEOF'
-import json, os, sys, shutil
-
-settings_path = sys.argv[1]
-
-try:
-    with open(settings_path, encoding='utf-8') as f:
-        cfg = json.load(f)
-except (json.JSONDecodeError, ValueError):
-    print(f'  [warn] {settings_path} is corrupt — backing up and recreating')
-    shutil.copy2(settings_path, settings_path + '.bak')
-    cfg = {}
-
-hooks = cfg.setdefault('hooks', {})
-
-memory_hooks = {
-    'SessionStart': [
-        {'type': 'command', 'command': '$HOME/.claude/hooks/prime-memory.sh', 'timeout': 10},
-        {'type': 'command', 'command': '$HOME/.claude/hooks/nudge-setup.sh', 'timeout': 3},
-    ],
-    'PostToolUse': [
-        {'type': 'command', 'command': '$HOME/.claude/hooks/capture-tool-context.sh', 'timeout': 3},
-    ],
-    'Stop': [
-        {'type': 'command', 'command': '$HOME/.claude/hooks/capture-decisions.sh', 'timeout': 3},
-    ],
-}
-
-changed = False
-for event, new_entries in memory_hooks.items():
-    groups = hooks.setdefault(event, [])
-    # Find or create catch-all matcher group
-    catch_all = None
-    for g in groups:
-        if g.get('matcher', '') == '':
-            catch_all = g
-            break
-    if catch_all is None:
-        catch_all = {'matcher': '', 'hooks': []}
-        groups.append(catch_all)
-    existing_cmds = {h.get('command', '') for h in catch_all.get('hooks', [])}
-    for entry in new_entries:
-        if entry['command'] not in existing_cmds:
-            catch_all.setdefault('hooks', []).append(entry)
-            changed = True
-
-if changed:
-    tmp = settings_path + '.tmp'
-    try:
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f, indent=2)
-            f.write('\n')
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, settings_path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    print(f'  [ok] Merged memory hooks into {settings_path}')
-else:
-    print(f'  [skip] Memory hooks already present in {settings_path}')
-PYEOF
+    python3 "${SCRIPT_DIR}/scripts/_hook_merge.py" --mode add --settings "${SETTINGS}" \
+        --event SessionStart --hook-file '$HOME/.claude/hooks/prime-memory.sh' --timeout 10
+    python3 "${SCRIPT_DIR}/scripts/_hook_merge.py" --mode add --settings "${SETTINGS}" \
+        --event SessionStart --hook-file '$HOME/.claude/hooks/nudge-setup.sh' --timeout 3
+    python3 "${SCRIPT_DIR}/scripts/_hook_merge.py" --mode add --settings "${SETTINGS}" \
+        --event PostToolUse --hook-file '$HOME/.claude/hooks/capture-tool-context.sh' --timeout 3
+    python3 "${SCRIPT_DIR}/scripts/_hook_merge.py" --mode add --settings "${SETTINGS}" \
+        --event Stop --hook-file '$HOME/.claude/hooks/capture-decisions.sh' --timeout 3
 fi
 
 echo ""

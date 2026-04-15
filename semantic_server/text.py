@@ -113,12 +113,12 @@ def load_aliases(memory_dir):
         with open(aliases_path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError, ValueError):
-        return SYNONYM_MAP
+        return dict(SYNONYM_MAP)
     if not isinstance(data, dict):
-        return SYNONYM_MAP
+        return dict(SYNONYM_MAP)
     groups = data.get("groups", [])
     if not isinstance(groups, list) or not groups:
-        return SYNONYM_MAP
+        return dict(SYNONYM_MAP)
     merged = dict(SYNONYM_MAP)
     for group in groups:
         if not isinstance(group, list) or len(group) < 2:

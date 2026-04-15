@@ -39,15 +39,20 @@ fi
 
 touch "$MARKER"
 
-SETUP_CMD="${HOME}/.claude/memory/.source-dir"
-if [ -f "$SETUP_CMD" ]; then
-    SETUP_CMD="$(cat "$SETUP_CMD")/setup-project.sh"
-else
-    # Fallback: use known install location
+# Resolve absolute path for setup-project.sh
+SETUP_CMD=""
+if [ -f "${HOME}/.claude/memory/.source-dir" ]; then
+    _SRC_DIR="$(cat "${HOME}/.claude/memory/.source-dir")"
+    _CANDIDATE="${_SRC_DIR}/setup-project.sh"
+    SETUP_CMD="$(readlink -f "$_CANDIDATE" 2>/dev/null || realpath "$_CANDIDATE" 2>/dev/null || echo "$_CANDIDATE")"
+fi
+if [ -z "$SETUP_CMD" ] || [ ! -f "$SETUP_CMD" ]; then
     if [ -f "${HOME}/.claude/memory/setup-project.sh" ]; then
-        SETUP_CMD="${HOME}/.claude/memory/setup-project.sh"
+        SETUP_CMD="$(readlink -f "${HOME}/.claude/memory/setup-project.sh" 2>/dev/null \
+            || realpath "${HOME}/.claude/memory/setup-project.sh" 2>/dev/null \
+            || echo "${HOME}/.claude/memory/setup-project.sh")"
     else
-        SETUP_CMD="setup-project.sh"
+        SETUP_CMD="${HOME}/.claude/memory/setup-project.sh"
     fi
 fi
 

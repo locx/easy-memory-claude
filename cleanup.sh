@@ -6,6 +6,7 @@
 set -euo pipefail
 
 CLAUDE_HOME="${HOME}/.claude"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -101,7 +102,7 @@ cleanup_project() {
     if [ -d "${dir}/.memory" ]; then
         ENTITY_COUNT=0
         if [ -f "${dir}/.memory/graph.jsonl" ]; then
-            ENTITY_COUNT=$(grep -c '"entity"' "${dir}/.memory/graph.jsonl" 2>/dev/null || echo 0)
+            ENTITY_COUNT=$(grep -c '"type":"entity"' "${dir}/.memory/graph.jsonl" 2>/dev/null || echo 0)
         fi
         echo "  Found .memory/ with ~${ENTITY_COUNT} entities"
         if confirm "Delete ${dir}/.memory/ ?"; then
@@ -360,7 +361,13 @@ cleanup_global() {
     # 2. Remove deployed hook scripts
     HOOKS=(prime-memory.sh capture-decisions.sh nudge-setup.sh capture-tool-context.sh capture_tool_context.py smart_recall.py)
     for hook in "${HOOKS[@]}"; do
-        remove_path "${CLAUDE_HOME}/hooks/${hook}" "~/.claude/hooks/${hook}"
+        if [ -e "${CLAUDE_HOME}/hooks/${hook}" ]; then
+            if confirm "Remove hook ${hook}?"; then
+                remove_path "${CLAUDE_HOME}/hooks/${hook}" "~/.claude/hooks/${hook}"
+            fi
+        else
+            echo "  [skip] ~.claude/hooks/${hook} — not found"
+        fi
     done
     # Remove hooks dir if empty
     if [ -d "${CLAUDE_HOME}/hooks" ] && [ -z "$(ls -A "${CLAUDE_HOME}/hooks" 2>/dev/null)" ]; then
@@ -371,82 +378,18 @@ cleanup_global() {
 
     # 3. Remove memory hook wiring from settings.json
     if [ -f "${CLAUDE_HOME}/settings.json" ]; then
-        python3 - "${CLAUDE_HOME}/settings.json" "$DRY_RUN" << 'PYEOF'
-import json, sys
-
-settings_path = sys.argv[1]
-dry_run = sys.argv[2] == 'true'
-
-try:
-    with open(settings_path, encoding='utf-8') as f:
-        cfg = json.load(f)
-except (json.JSONDecodeError, ValueError, OSError):
-    print('  [skip] settings.json — unreadable')
-    sys.exit(0)
-
-hooks = cfg.get('hooks', {})
-if not hooks:
-    print('  [skip] settings.json — no hooks section')
-    sys.exit(0)
-
-memory_commands = {
-    '$HOME/.claude/hooks/prime-memory.sh',
-    '$HOME/.claude/hooks/capture-decisions.sh',
-    '$HOME/.claude/hooks/nudge-setup.sh',
-    '$HOME/.claude/hooks/capture-tool-context.sh',
-}
-
-changed = False
-for event in list(hooks.keys()):
-    groups = hooks[event]
-    if not isinstance(groups, list):
-        continue
-    for group in groups:
-        hook_list = group.get('hooks', [])
-        original_len = len(hook_list)
-        group['hooks'] = [
-            h for h in hook_list
-            if h.get('command', '') not in memory_commands
-        ]
-        if len(group['hooks']) < original_len:
-            changed = True
-    # Remove empty groups
-    hooks[event] = [
-        g for g in groups
-        if g.get('hooks')
-    ]
-    # Remove empty events
-    if not hooks[event]:
-        del hooks[event]
-        changed = True
-
-if not changed:
-    print('  [skip] settings.json — no memory hooks found')
-    sys.exit(0)
-
-if dry_run:
-    print('  [dry-run] Would remove memory hooks from settings.json')
-    sys.exit(0)
-
-# Remove hooks key entirely if empty
-if not hooks:
-    del cfg['hooks']
-
-import os
-tmp = settings_path + '.tmp'
-with open(tmp, 'w', encoding='utf-8') as f:
-    json.dump(cfg, f, indent=2)
-    f.write('\n')
-    f.flush()
-    os.fsync(f.fileno())
-os.replace(tmp, settings_path)
-print('  \033[0;32m[removed]\033[0m memory hooks from settings.json')
-PYEOF
+        _dry_flag=""
+        if $DRY_RUN; then _dry_flag="--dry-run"; fi
+        python3 "${SCRIPT_DIR}/scripts/_hook_merge.py" --mode strip \
+            --settings "${CLAUDE_HOME}/settings.json" ${_dry_flag}
     fi
 
     # 4. Clean up all temp markers
-    if ! $DRY_RUN; then
+    if $DRY_RUN; then
+        echo "  [dry-run] Would remove /tmp/.claude-mem-* markers"
+    elif confirm "Remove /tmp/.claude-mem-* temp markers?"; then
         rm -f /tmp/.claude-mem-* 2>/dev/null || true
+        echo "  [removed] /tmp/.claude-mem-* markers"
     fi
 }
 

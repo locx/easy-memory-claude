@@ -41,7 +41,6 @@ def _build_norm_index(existing_entities):
     for name in existing_entities:
         norm = normalize_name(name)
         if norm and len(norm) >= 3:
-            # Keep first occurrence on collision
             index.setdefault(norm, name)
     return index
 
@@ -57,15 +56,33 @@ def _find_similar_entity(name, norm_index):
     return None
 
 
+def _validate_list_arg(val, max_n, label):
+    """Validate that val is a list within max_n length; return (list, error_dict)."""
+    if not isinstance(val, list):
+        return None, {"error": f"{label} must be a list"}
+    if len(val) > max_n:
+        return None, {"error": f"Max {max_n} {label} per call"}
+    return val, None
+
+
+def _fuzzy_resolve_existing(name, norm_idx):
+    """Return similar existing entity name or None."""
+    norm = normalize_name(name)
+    if not norm or len(norm) < 3:
+        return None
+    existing = norm_idx.get(norm)
+    if existing and existing != name:
+        return existing
+    return None
+
+
 def create_entities(entities_input, memory_dir):
     """Create entities via append-only write."""
-    if not isinstance(entities_input, list):
-        return {"error": "entities must be a list"}
-    if len(entities_input) > MAX_ENTITIES_PER_CALL:
-        return {
-            "error": f"Max {MAX_ENTITIES_PER_CALL} "
-                     f"entities per call"
-        }
+    entities_input, err = _validate_list_arg(
+        entities_input, MAX_ENTITIES_PER_CALL, "entities"
+    )
+    if err:
+        return err
     size_err = check_graph_size(memory_dir)
     if size_err:
         return size_err
@@ -108,7 +125,6 @@ def create_entities(entities_input, memory_dir):
             "message": "No valid entities",
         }
 
-    # Fuzzy match: pre-normalize once, then O(1) lookups
     existing = load_graph_entities(memory_dir)
     norm_index = _build_norm_index(existing)
     similar_warnings = []
@@ -116,7 +132,7 @@ def create_entities(entities_input, memory_dir):
         name = entry["name"]
         if name in existing:
             continue
-        similar = _find_similar_entity(name, norm_index)
+        similar = _fuzzy_resolve_existing(name, norm_index)
         if similar:
             similar_warnings.append(
                 f"'{name}' similar to existing "
@@ -148,13 +164,11 @@ def create_entities(entities_input, memory_dir):
 
 def create_relations(relations_input, memory_dir):
     """Create relations via append-only write."""
-    if not isinstance(relations_input, list):
-        return {"error": "relations must be a list"}
-    if len(relations_input) > MAX_RELATIONS_PER_CALL:
-        return {
-            "error": f"Max {MAX_RELATIONS_PER_CALL} "
-                     f"relations per call"
-        }
+    relations_input, err = _validate_list_arg(
+        relations_input, MAX_RELATIONS_PER_CALL, "relations"
+    )
+    if err:
+        return err
     size_err = check_graph_size(memory_dir)
     if size_err:
         return size_err
@@ -216,10 +230,15 @@ _NEG_WORDS = frozenset({
     "removed", "deprecated", "reverted",
     "disabled", "dropped", "replaced",
     "incorrect", "wrong", "broken",
+    "cannot", "cant", "wont", "without",
+    "fails", "failing",
 })
 
 
-def _detect_contradictions(new_obs, existing_obs):
+def _detect_contradictions(new_obs, existing_obs,
+                           enable_contradictions=False):
+    if not enable_contradictions:
+        return []
     conflicts = []
     for new_o in new_obs:
         new_lower = set(new_o.lower().split())
@@ -231,15 +250,28 @@ def _detect_contradictions(new_obs, existing_obs):
             exist_has_neg = bool(exist_lower & _NEG_WORDS)
             if new_has_neg != exist_has_neg:
                 shared = (new_lower & exist_lower) - {
-                    "the", "a", "is", "are", "was", "to", "in", "for", "and", "of", "it", "this", "that", "with"
+                    "the", "a", "is", "are", "was", "to",
+                    "in", "for", "and", "of", "it",
+                    "this", "that", "with",
                 }
                 if len(shared) >= 3:
-                    conflicts.append({"new": new_o[:100], "existing": exist_o[:100]})
+                    conflicts.append({
+                        "new": new_o[:100],
+                        "existing": exist_o[:100],
+                    })
             if len(conflicts) >= 3:
                 break
         if len(conflicts) >= 3:
             break
     return conflicts
+
+
+def _apply_observations(entity_name, new_obs, cur_obs_keys):
+    """Filter new_obs against existing dedup keys; return filtered list."""
+    return [
+        o for o in new_obs
+        if _obs_dedup_key(o) not in cur_obs_keys
+    ]
 
 
 def add_observations(entity_name, observations, memory_dir,
@@ -251,13 +283,11 @@ def add_observations(entity_name, observations, memory_dir,
     if not isinstance(entity_name, str) \
             or not entity_name:
         return {"error": "entity name required"}
-    if not isinstance(observations, list):
-        return {"error": "observations must be a list"}
-    if len(observations) > MAX_OBS_PER_CALL:
-        return {
-            "error": f"Max {MAX_OBS_PER_CALL} "
-                     f"observations per call"
-        }
+    observations, err = _validate_list_arg(
+        observations, MAX_OBS_PER_CALL, "observations"
+    )
+    if err:
+        return err
     size_err = check_graph_size(memory_dir)
     if size_err:
         return size_err
@@ -280,8 +310,6 @@ def add_observations(entity_name, observations, memory_dir,
     except OSError:
         pre_mtime = 0.0
 
-    # Must use load_graph_entities (not raw cache) for
-    # cache coherence after create_entities in same session
     cached = load_graph_entities(memory_dir)
     if entity_name not in cached:
         return {
@@ -294,10 +322,9 @@ def add_observations(entity_name, observations, memory_dir,
         _obs_dedup_key(o)
         for o in info.get("observations", [])
     }
-    new_obs = [
-        o for o in new_obs
-        if _obs_dedup_key(o) not in cur_obs_keys
-    ]
+    new_obs = _apply_observations(
+        entity_name, new_obs, cur_obs_keys
+    )
     if not new_obs:
         return {
             "added": 0,
@@ -306,19 +333,29 @@ def add_observations(entity_name, observations, memory_dir,
         }
     etype = info.get("entityType", "")
     created = info.get("_created", now)
-    conflicts = _detect_contradictions(new_obs, info.get("observations", []))
+    conflicts = _detect_contradictions(
+        new_obs, info.get("observations", [])
+    )
 
-    # Check for concurrent delete/update between read and write
     try:
         post_mtime = os.path.getmtime(graph_path)
     except OSError:
         post_mtime = 0.0
-    if post_mtime != pre_mtime and not _retry:
-        invalidate_caches()
-        return add_observations(
-            entity_name, observations, memory_dir,
-            _retry=True,
+    if post_mtime != pre_mtime:
+        if not _retry:
+            invalidate_caches()
+            return add_observations(
+                entity_name, observations, memory_dir,
+                _retry=True,
+            )
+        log_event(
+            "RACE",
+            f'concurrent write on entity="{entity_name}"',
         )
+        return {
+            "error": "concurrent write",
+            "entity": entity_name,
+        }
 
     if not append_jsonl(memory_dir, [{
         "type": "entity",
@@ -356,8 +393,11 @@ def delete_entities(entity_names, memory_dir,
 
     Mtime guard detects concurrent writes — retries once.
     """
-    if not isinstance(entity_names, list):
-        return {"error": "entity_names must be a list"}
+    entity_names, err = _validate_list_arg(
+        entity_names, MAX_ENTITIES_PER_CALL, "entity_names"
+    )
+    if err:
+        return err
 
     graph_path = os.path.join(memory_dir, "graph.jsonl")
     try:
@@ -392,11 +432,20 @@ def delete_entities(entity_names, memory_dir,
         post_mtime = os.path.getmtime(graph_path)
     except OSError:
         post_mtime = 0.0
-    if post_mtime != pre_mtime and not _retry:
-        invalidate_caches()
-        return delete_entities(
-            entity_names, memory_dir, _retry=True,
+    if post_mtime != pre_mtime:
+        if not _retry:
+            invalidate_caches()
+            return delete_entities(
+                entity_names, memory_dir, _retry=True,
+            )
+        log_event(
+            "RACE",
+            f"concurrent write on delete: {list(to_delete)[:5]}",
         )
+        return {
+            "error": "concurrent write",
+            "entity": list(to_delete),
+        }
 
     try:
         rewrite_graph(memory_dir, remaining, kept_rels)
@@ -405,7 +454,6 @@ def delete_entities(entity_names, memory_dir,
             "error": "Write failed (lock timeout)",
             "deleted": 0,
         }
-    # rewrite_graph already calls invalidate_caches()
 
     n_del = len(to_delete)
     n_rels = len(rels) - len(kept_rels)
@@ -430,7 +478,9 @@ def _build_decision_obs(args):
     if isinstance(alts, list):
         for alt in alts[:10]:
             if isinstance(alt, str) and alt.strip():
-                obs.append(f"Alternative rejected: {alt[:MAX_OBS_LENGTH]}")
+                obs.append(
+                    f"Alternative rejected: {alt[:MAX_OBS_LENGTH]}"
+                )
 
     scope = args.get("scope", "")
     if isinstance(scope, str) and scope.strip():
@@ -441,13 +491,19 @@ def _build_decision_obs(args):
         obs.append(f"Chosen: {chosen[:MAX_OBS_LENGTH]}")
 
     outcome = args.get("outcome", "pending")
+    warnings = []
     if outcome not in (
         "pending", "successful", "failed", "revised",
         "adopted", "rejected", "deferred", "obsolete",
     ):
         outcome = "pending"
+        warnings.append("invalid outcome coerced to pending")
     obs.append(f"Outcome: {outcome}")
-    return obs, outcome
+    result = (obs, outcome)
+    if warnings:
+        return obs, outcome, warnings
+    return obs, outcome, []
+
 
 def create_decision(args, memory_dir):
     """Create a structured decision entity with relations."""
@@ -462,7 +518,7 @@ def create_decision(args, memory_dir):
     if not rationale or not isinstance(rationale, str):
         return {"error": "rationale is required"}
 
-    obs, outcome = _build_decision_obs(args)
+    obs, outcome, obs_warnings = _build_decision_obs(args)
 
     entity_name = f"{_DECISION_PREFIX}{title}"
     result = create_entities(
@@ -502,6 +558,8 @@ def create_decision(args, memory_dir):
         "decision": entity_name,
         "outcome": outcome,
     }
+    if obs_warnings:
+        resp["warnings"] = obs_warnings
     if rel_result and "error" in rel_result:
         resp["relations_error"] = rel_result["error"]
     elif rel_result:
@@ -534,7 +592,6 @@ def update_decision_outcome(args, memory_dir):
 
     lesson = args.get("lesson", "")
 
-    # Try both prefixed and unprefixed names
     if title.startswith(_DECISION_PREFIX):
         candidates = [title]
     else:
@@ -549,80 +606,92 @@ def update_decision_outcome(args, memory_dir):
             f"Lesson: {lesson[:MAX_OBS_LENGTH]}"
         )
 
+    entities = load_graph_entities(memory_dir)
     for entity_name in candidates:
+        entity_exists = entity_name in entities
         result = add_observations(
             entity_name, new_obs, memory_dir
         )
-        if "error" not in result:
-            log_event(
-                "OUTCOME",
-                f'"{title}" -> {outcome}'
-                + (f" lesson: {lesson[:80]}"
-                   if lesson else ""),
-            )
-            return {
-                "updated": entity_name,
-                "outcome": outcome,
-                "observations_added": result.get(
-                    "added", 0
-                ),
-            }
+        if isinstance(result.get("error"), str):
+            if entity_exists:
+                return {
+                    "error": f"Write failed for '{entity_name}': "
+                             + result["error"],
+                }
+            continue
+        log_event(
+            "OUTCOME",
+            f'"{title}" -> {outcome}'
+            + (f" lesson: {lesson[:80]}"
+               if lesson else ""),
+        )
+        return {
+            "updated": entity_name,
+            "outcome": outcome,
+            "observations_added": result.get(
+                "added", 0
+            ),
+        }
 
     return {
         "error": f"Decision '{title}' not found",
     }
 
 
-def _file_info(path):
-    """Return (mtime_iso, size_kb) or (None, 0)."""
+def _file_iso(path):
+    """Return mtime as ISO string or None."""
     try:
         mt = os.path.getmtime(path)
         return time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(mt)
-        ), os.path.getsize(path) // 1024
+        )
     except OSError:
-        return None, 0
+        return None
 
 
-def graph_stats(memory_dir):
-    """Return graph health and session stats."""
-    entities = load_graph_entities(memory_dir)
-    relations = load_graph_relations(memory_dir)
+def _file_kb(path):
+    """Return file size in KB or 0."""
+    try:
+        return os.path.getsize(path) // 1024
+    except OSError:
+        return 0
 
+
+def _file_info(path):
+    """Return (mtime_iso, size_kb) or (None, 0)."""
+    return _file_iso(path), _file_kb(path)
+
+
+def _stats_counts(entities, relations):
     type_counts = Counter(
         normalize_type(info.get("entityType", "unknown")) or "unknown"
         for info in entities.values()
     )
-
     branch_counts = Counter(
         info.get("_branch", "unknown")
         for info in entities.values()
     )
+    return type_counts, branch_counts
 
-    _, graph_kb = _file_info(
+
+def _stats_file_info(memory_dir):
+    graph_kb = _file_kb(
         os.path.join(memory_dir, "graph.jsonl")
     )
-    index_age, index_kb = _file_info(
+    index_age = _file_iso(
         os.path.join(memory_dir, "tfidf_index.json")
     )
-    last_maint, _ = _file_info(
+    index_kb = _file_kb(
+        os.path.join(memory_dir, "tfidf_index.json")
+    )
+    last_maint = _file_iso(
         os.path.join(memory_dir, ".last-maintenance")
     )
+    return graph_kb, index_age, index_kb, last_maint
 
-    try:
-        from .recall import recall_counts as _rc
-        top_recall = sorted(
-            (
-                (n, c) for n, c in _rc.items()
-                if isinstance(c, (int, float))
-            ),
-            key=lambda x: x[1],
-            reverse=True,
-        )[:10]
-    except Exception:
-        top_recall = []
 
-    n_pending = sum(
+def _stats_pending_count(entities):
+    return sum(
         1 for info in entities.values()
         if info.get("entityType") == "decision"
         and not any(
@@ -632,6 +701,36 @@ def graph_stats(memory_dir):
             for o in info.get("observations", [])
         )
     )
+
+
+def _stats_recall_summary():
+    try:
+        from .recall import recall_counts as _rc
+        return sorted(
+            (
+                (n, c) for n, c in _rc.items()
+                if isinstance(c, (int, float))
+            ),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:10]
+    except (ImportError, AttributeError):
+        return []
+
+
+def graph_stats(memory_dir):
+    """Return graph health and session stats."""
+    entities = load_graph_entities(memory_dir)
+    relations = load_graph_relations(memory_dir)
+
+    type_counts, branch_counts = _stats_counts(
+        entities, relations
+    )
+    graph_kb, index_age, index_kb, last_maint = (
+        _stats_file_info(memory_dir)
+    )
+    top_recall = _stats_recall_summary()
+    n_pending = _stats_pending_count(entities)
 
     result = {
         "entities": len(entities),
@@ -664,13 +763,14 @@ def graph_stats(memory_dir):
     return result
 
 
-def list_decisions(memory_dir, stale_days=None):
+def list_decisions(memory_dir, stale_days=None, limit=50):
     """List all decisions with status.
 
     Args:
         stale_days: If set, return only pending decisions
             older than this many days (stale hygiene).
             stale_days=0 returns all pending decisions.
+        limit: Max number of decisions to return (default 50).
     """
     if stale_days is not None:
         try:
@@ -678,9 +778,15 @@ def list_decisions(memory_dir, stale_days=None):
         except (TypeError, ValueError):
             return {"error": "stale_days must be a number"}
 
+    try:
+        limit = max(1, int(limit))
+    except (TypeError, ValueError):
+        limit = 50
+
     entities = load_graph_entities(memory_dir)
     now_ts = time.time()
     decisions = []
+    parse_errors = []
     for name, info in entities.items():
         if info.get("entityType") != "decision":
             continue
@@ -690,6 +796,7 @@ def list_decisions(memory_dir, stale_days=None):
             if isinstance(o, str) \
                     and o.startswith("Outcome: "):
                 outcome = o[9:]
+                break
         updated = info.get("_updated", "")
 
         if stale_days is not None:
@@ -704,23 +811,34 @@ def list_decisions(memory_dir, stale_days=None):
                     if age < stale_days:
                         continue
                 except (ValueError, OverflowError):
-                    pass
+                    parse_errors.append(
+                        f"date parse failed for '{name}': {updated!r}"
+                    )
 
         display = name
         if display.startswith(_DECISION_PREFIX):
             display = display[len(_DECISION_PREFIX):]
+        truncated = len(obs) > 5
         decisions.append({
             "title": display,
             "outcome": outcome,
             "observations": obs[:5],
+            "observations_truncated": truncated,
             "updated": updated,
         })
-    # Newest first by default; oldest first for stale hygiene
+
     decisions.sort(
         key=lambda d: d["updated"],
         reverse=(stale_days is None),
     )
-    return {"decisions": decisions, "total": len(decisions)}
+    decisions = decisions[:limit]
+    resp = {
+        "decisions": decisions,
+        "total": len(decisions),
+    }
+    if parse_errors:
+        resp["parse_errors"] = parse_errors
+    return resp
 
 
 def remove_observations(entity_name, observations,
@@ -757,10 +875,42 @@ def remove_observations(entity_name, observations,
         rewrite_graph(memory_dir, updated, rels)
     except OSError:
         return {"error": "Write failed (lock timeout)"}
-    # rewrite_graph already calls invalidate_caches()
     log_event("REMOVE_OBS",
               f'entity="{entity_name}" removed={removed}')
     return {"removed": removed}
+
+
+def _rewrite_relations_for_rename(rels, old_name, new_name):
+    """Rewrite relation list substituting old_name -> new_name.
+
+    Drops self-loops and deduplicates edges.
+    Returns (fixed_rels, relations_updated, dropped_self_loops, dropped_dups).
+    """
+    fixed_rels = []
+    seen_rels = set()
+    dropped_self_loops = 0
+    dropped_dups = 0
+    relations_updated = 0
+    for r in rels:
+        orig_fr = r.get("from", "")
+        orig_to = r.get("to", "")
+        fr = new_name if orig_fr == old_name else orig_fr
+        to = new_name if orig_to == old_name else orig_to
+        if fr == to:
+            dropped_self_loops += 1
+            continue
+        rt = r.get("relationType", "")
+        key = (fr, to, rt)
+        if key in seen_rels:
+            dropped_dups += 1
+            continue
+        seen_rels.add(key)
+        fixed_rels.append({
+            "from": fr, "to": to, "relationType": rt,
+        })
+        if orig_fr == old_name or orig_to == old_name:
+            relations_updated += 1
+    return fixed_rels, relations_updated, dropped_self_loops, dropped_dups
 
 
 def rename_entity(old_name, new_name, memory_dir):
@@ -791,36 +941,14 @@ def rename_entity(old_name, new_name, memory_dir):
             updated[name] = info
 
     rels = load_graph_relations(memory_dir)
-    fixed_rels = []
-    seen_rels = set()
-    dropped_self_loops = 0
-    dropped_dups = 0
-    relations_updated = 0
-    for r in rels:
-        orig_fr = r.get("from", "")
-        orig_to = r.get("to", "")
-        fr = new_name if orig_fr == old_name else orig_fr
-        to = new_name if orig_to == old_name else orig_to
-        if fr == to:
-            dropped_self_loops += 1
-            continue
-        rt = r.get("relationType", "")
-        key = (fr, to, rt)
-        if key in seen_rels:
-            dropped_dups += 1
-            continue
-        seen_rels.add(key)
-        fixed_rels.append({
-            "from": fr, "to": to, "relationType": rt,
-        })
-        if orig_fr == old_name or orig_to == old_name:
-            relations_updated += 1
+    fixed_rels, relations_updated, dropped_self_loops, dropped_dups = (
+        _rewrite_relations_for_rename(rels, old_name, new_name)
+    )
 
     try:
         rewrite_graph(memory_dir, updated, fixed_rels)
     except OSError:
         return {"error": "Write failed (lock timeout)"}
-    # rewrite_graph already calls invalidate_caches()
     log_event("RENAME",
               f'"{old_name}" -> "{new_name}"')
     resp = {

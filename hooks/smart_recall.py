@@ -103,8 +103,26 @@ def _parse_iso_days_ago(ts, now_ts):
 
 
 def _get_active_files(project_dir):
-    """Get list of recently modified/active files via git status."""
+    """Get list of recently modified/active files via git status.
+
+    Result is cached to /tmp for 60s to reduce SessionStart latency.
+    Gate behind CLAUDE_MEM_NO_GIT_STATUS=1 to skip entirely.
+    """
+    if os.environ.get("CLAUDE_MEM_NO_GIT_STATUS"):
+        return set()
     import subprocess
+    cache_key = "".join(
+        c if c.isalnum() or c in ('_', '-') else '_'
+        for c in project_dir
+    )[:64]
+    cache_file = f"/tmp/.claude-mem-gitstatus-{cache_key}"
+    try:
+        age = time.time() - os.path.getmtime(cache_file)
+        if 0 <= age < 60:
+            with open(cache_file, encoding="utf-8") as f:
+                return set(json.load(f))
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
     try:
         out = subprocess.check_output(
             ["git", "-C", project_dir, "status", "-s"],
@@ -117,9 +135,15 @@ def _get_active_files(project_dir):
                 basename = os.path.basename(path)
                 if basename:
                     files.append(basename.lower())
-        return set(files)
+        result = set(files)
     except Exception:
-        return set()
+        result = set()
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(list(result), f)
+    except OSError:
+        pass
+    return result
 
 
 def _read_recall_counts(memory_dir):
@@ -331,7 +355,11 @@ def _print_pending_decisions(entities, now_ts):
 
     pending.sort(reverse=True)  # oldest first
     stale = [p for p in pending if p[0] >= _STALE_DECISION_DAYS]
-    fresh = [p for p in pending if p[0] < _STALE_DECISION_DAYS]
+    # fresh: newest-first (ascending days = most recent first)
+    fresh = sorted(
+        [p for p in pending if p[0] < _STALE_DECISION_DAYS],
+        key=lambda x: x[0],
+    )
 
     if stale:
         print(f"  Stale decisions ({len(stale)}, >{_STALE_DECISION_DAYS}d):")
@@ -348,25 +376,19 @@ def _print_pending_decisions(entities, now_ts):
             print(f"    +{len(fresh) - 3} more")
 
 
-def _stamp_session_start(memory_dir):
-    """Write current timestamp to .last-session-start for mem diff."""
+def _read_session_start_ts(memory_dir):
+    """Read last session start timestamp (written by Stop hook)."""
     marker = os.path.join(memory_dir, ".last-session-start")
     try:
-        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        with open(marker, "w") as f:
-            f.write(ts)
+        with open(marker) as f:
+            return f.read().strip()
     except OSError:
-        pass
+        return ""
 
 
 def _count_changes_since_last_session(entities, memory_dir):
     """Count entities added/updated since last session."""
-    marker = os.path.join(memory_dir, ".last-session-start")
-    try:
-        with open(marker) as f:
-            last_ts = f.read().strip()
-    except OSError:
-        return 0, 0
+    last_ts = _read_session_start_ts(memory_dir)
     if not last_ts:
         return 0, 0
     new_count = 0
@@ -394,21 +416,20 @@ def main():
     # Load config overrides
     _load_recall_config(memory_dir)
 
-    # Check for changes since last session before stamping
     entities, relations = _load_graph(memory_dir)
 
+    # Read (not write) last-session-start — Stop hook owns the write
     new_count, updated_count = _count_changes_since_last_session(
         entities, memory_dir
     )
 
-    # Stamp session start for next diff
-    _stamp_session_start(memory_dir)
+    if not entities and not relations:
+        # Suppress output entirely when nothing to show
+        return
 
     if not entities:
         if relations:
             print("Memory graph has relations but no entities.")
-        else:
-            print("Memory graph is empty.")
         return
 
     recall_counts = _read_recall_counts(memory_dir)
@@ -434,6 +455,19 @@ def main():
     n_rel = len(relations)
     n_dec = type_counts.get("decision", 0)
     n_warn = type_counts.get("file-warning", 0)
+
+    has_pending = any(
+        info.get("entityType") == "decision" and not any(
+            isinstance(o, str) and o.startswith("Outcome: ")
+            and not o.startswith("Outcome: pending")
+            for o in info.get("observations", [])
+        )
+        for info in entities.values()
+    )
+
+    # Suppress output when nothing useful to show
+    if not scored and not has_pending:
+        return
 
     # Session diff summary
     diff_str = ""

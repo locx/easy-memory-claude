@@ -1,5 +1,6 @@
 """Cache infrastructure: mtime-based caches with size-aware eviction."""
 
+import sys
 from sys import getsizeof
 
 from .config import MAX_CACHE_BYTES
@@ -22,7 +23,7 @@ adjacency_cache = {
 last_index_check = 0.0
 
 _DEPTH_CAP = 3
-_STRING_OVERHEAD = 49  # CPython str header
+_STRING_OVERHEAD = sys.getsizeof("")
 
 
 def clear_index_cache():
@@ -94,7 +95,6 @@ def maybe_evict_caches():
         (entity_cache, clear_entity_cache),
         (relation_cache, clear_relation_cache),
     ]
-    # Sort by size descending — evict largest first
     evictable.sort(key=lambda x: x[0]["size"], reverse=True)
     for cache, clear_fn in evictable:
         if cache["size"] > 0:

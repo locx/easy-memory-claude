@@ -2,54 +2,62 @@
 
 Extracted from maintenance.py to reduce bloat and share with search.
 """
+from collections import OrderedDict
+
+# Table-driven suffix rules for each step: (suffix, min_len, replacement)
+_STEP1_RULES = [
+    ('ies', 4, 'i'),
+    ('sses', 4, 'ss'),
+    ('ness', 4, ''),
+]
+_STEP2_RULES = [
+    ('ated', 6, 'ate'),
+    ('ied', 4, 'i'),
+    ('ed', 4, ''),
+    ('ing', 5, ''),
+    ('ation', 6, ''),
+    ('tion', 5, 't'),
+]
+_STEP3_RULES = [
+    ('ously', 6, ''),
+    ('ably', 5, ''),
+    ('ibly', 5, ''),
+    ('ally', 5, 'al'),
+    ('ly', 4, ''),
+    ('ful', 5, ''),
+    ('ment', 5, ''),
+    ('able', 5, ''),
+    ('ible', 5, ''),
+]
+
+
+def _apply_rules(word, rules):
+    for suffix, min_len, repl in rules:
+        if word.endswith(suffix) and len(word) > min_len:
+            return word[:-len(suffix)] + repl
+    return word
+
 
 def _stem_step1(word):
-    if word.endswith('ies') and len(word) > 4:
-        return word[:-3] + 'i'
     if word.endswith('sses'):
         return word[:-2]
     if word.endswith('ness'):
         return word[:-4]
+    if word.endswith('ies') and len(word) > 4:
+        return word[:-3] + 'i'
     if (word.endswith('s') and not word.endswith('ss')
             and not word.endswith('us') and len(word) > 3):
         return word[:-1]
     return word
 
+
 def _stem_step2(word):
-    if word.endswith('ated') and len(word) > 6:
-        return word[:-4] + 'ate'
-    if word.endswith('ied') and len(word) > 4:
-        return word[:-3] + 'i'
-    if word.endswith('ed') and not word.endswith('eed') and len(word) > 4:
-        return word[:-2]
-    if word.endswith('ing') and len(word) > 5:
-        return word[:-3]
-    if word.endswith('ation') and len(word) > 6:
-        return word[:-5]
-    if word.endswith('tion') and len(word) > 5:
-        return word[:-4] + 't'
-    return word
+    return _apply_rules(word, _STEP2_RULES)
+
 
 def _stem_step3(word):
-    if word.endswith('ously') and len(word) > 6:
-        return word[:-5]
-    if word.endswith('ably') and len(word) > 5:
-        return word[:-4]
-    if word.endswith('ibly') and len(word) > 5:
-        return word[:-4]
-    if word.endswith('ally') and len(word) > 5:
-        return word[:-4] + 'al'
-    if word.endswith('ly') and len(word) > 4:
-        return word[:-2]
-    if word.endswith('ful') and len(word) > 5:
-        return word[:-3]
-    if word.endswith('ment') and len(word) > 5:
-        return word[:-4]
-    if word.endswith('able') and len(word) > 5:
-        return word[:-4]
-    if word.endswith('ible') and len(word) > 5:
-        return word[:-4]
-    return word
+    return _apply_rules(word, _STEP3_RULES)
+
 
 def porter_stem(word):
     """Pure-Python Porter stemmer for common suffixes."""
@@ -60,21 +68,20 @@ def porter_stem(word):
     word = _stem_step3(word)
     return word
 
-# Stem cache — avoids re-stemming the same word
-_stem_cache = {}
+
+# Stem cache — true LRU via OrderedDict
+_stem_cache = OrderedDict()
 _STEM_CACHE_MAX = 50_000
 
+
 def stem_word(word):
-    """Cached Porter stem lookup with bounded LRU eviction."""
-    s = _stem_cache.get(word)
-    if s is not None:
-        return s
+    """Cached Porter stem lookup with true LRU eviction."""
+    if word in _stem_cache:
+        _stem_cache.move_to_end(word)
+        return _stem_cache[word]
     s = porter_stem(word)
-    if len(_stem_cache) >= _STEM_CACHE_MAX:
-        # Evict oldest half to amortize eviction cost
-        to_keep = _STEM_CACHE_MAX // 2
-        keys = list(_stem_cache.keys())
-        for k in keys[:len(keys) - to_keep]:
-            del _stem_cache[k]
     _stem_cache[word] = s
+    _stem_cache.move_to_end(word)
+    if len(_stem_cache) > _STEM_CACHE_MAX:
+        _stem_cache.popitem(last=False)
     return s

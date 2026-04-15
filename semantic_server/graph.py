@@ -38,8 +38,8 @@ from .text import normalize_type
 def _obs_dedup_key(obs):
     """Normalize an observation to a hashable dedup key."""
     if isinstance(obs, str):
-        return obs
-    return json.dumps(obs, sort_keys=True)
+        return ("s", obs)
+    return ("d", json.dumps(obs, sort_keys=True))
 
 
 def _merge_obs(prev_obs, new_obs, seen=None):
@@ -164,9 +164,11 @@ def _handle_entity_entry(entities, obs_keys, obj):
 def _handle_relation_entry(relations, rel_seen, obj):
     r_from = obj.get("from", "")
     r_to = obj.get("to", "")
+    if not isinstance(r_from, str) or not isinstance(r_to, str):
+        return
     if not r_from or not r_to:
         return
-    r_type = obj.get("relationType", "")
+    r_type = normalize_type(obj.get("relationType", ""))
     rel_key = (r_from, r_to, r_type)
     if rel_key not in rel_seen:
         rel_seen.add(rel_key)
@@ -214,7 +216,6 @@ def _parse_graph_file(graph_path, start_offset=0, seed_obs_keys=None):
         if name not in entities:
             obs_keys.pop(name, None)
     return entities, relations, obs_keys, end_offset
-
 
 
 def _do_full_parse(graph_path, mtime):
@@ -307,6 +308,51 @@ def _merge_incremental_data(existing_ents, existing_obs_keys,
             relation_cache["size"] += estimate_size(added)
 
 
+def _try_incremental_load(graph_path, mtime, prev_offset):
+    """Attempt incremental load from prev_offset. Returns entities or None on failure."""
+    # Size regression guard: if file shrank, it was rewritten — force full load
+    current_size = mtime[1] if isinstance(mtime, tuple) else None
+    if current_size is not None and current_size < prev_offset:
+        return None
+
+    if mtime == entity_cache.get("_pre_invalidate_mtime", 0.0):
+        entity_cache["append_only"] = False
+        return None
+
+    existing_obs_keys = entity_cache.get("obs_keys") or {}
+    new_ents, new_rels, new_obs_keys, offset = _parse_graph_file(
+        graph_path, start_offset=prev_offset,
+    )
+    if new_ents is None:
+        entity_cache["append_only"] = False
+        entity_cache.pop("_pre_invalidate_mtime", None)
+        return None
+
+    existing = entity_cache["data"]
+    _merge_incremental_data(
+        existing, existing_obs_keys,
+        new_ents, new_obs_keys or {}, new_rels,
+    )
+    entity_cache["mtime"] = mtime
+    entity_cache["offset"] = offset
+    entity_cache["size"] = estimate_size(existing)
+    entity_cache["append_only"] = False
+    entity_cache["obs_keys"] = existing_obs_keys
+    entity_cache.pop("_pre_invalidate_mtime", None)
+    if relation_cache["data"] is not None:
+        relation_cache["mtime"] = mtime
+    if new_rels:
+        adjacency_cache.update(outbound=None, inbound=None, mtime=0.0)
+    maybe_evict_caches()
+    return existing
+
+
+def _full_load(graph_path, mtime):
+    """Full parse path."""
+    entities, _ = _do_full_parse(graph_path, mtime)
+    return entities
+
+
 def load_graph_entities(memory_dir):
     """Load entities with mtime cache + incremental reads."""
     graph_path, mtime = get_graph_mtime(memory_dir)
@@ -320,51 +366,16 @@ def load_graph_entities(memory_dir):
             and entity_cache["mtime"] == mtime):
         return entity_cache["data"]
 
-    # Incremental read if append-only flag is set
     prev_offset = entity_cache.get("offset", 0)
     if (entity_cache.get("append_only")
             and entity_cache["data"] is not None
             and entity_cache["path"] == graph_path
             and prev_offset > 0):
-        # Guard: verify mtime actually advanced (file was written)
-        # If mtime hasn't changed, hook/concurrent write may not
-        # have flushed yet — fall through to full re-parse.
-        # Use mtime already fetched at top of function (no 2nd stat).
-        if mtime == entity_cache.get("_pre_invalidate_mtime", 0.0):
-            # mtime unchanged since invalidation — force full parse
-            entity_cache["append_only"] = False
-        else:
-            existing_obs_keys = entity_cache.get("obs_keys") or {}
-            new_ents, new_rels, new_obs_keys, offset = _parse_graph_file(
-                graph_path, start_offset=prev_offset,
-            )
-            if new_ents is None:
-                entity_cache["append_only"] = False
-                entity_cache.pop("_pre_invalidate_mtime", None)
-            else:
-                existing = entity_cache["data"]
-                _merge_incremental_data(
-                    existing, existing_obs_keys,
-                    new_ents, new_obs_keys or {}, new_rels,
-                )
-                entity_cache["mtime"] = mtime
-                entity_cache["offset"] = offset
-                entity_cache["size"] = estimate_size(existing)
-                entity_cache["append_only"] = False
-                entity_cache["obs_keys"] = existing_obs_keys
-                entity_cache.pop("_pre_invalidate_mtime", None)
-                if relation_cache["data"] is not None:
-                    relation_cache["mtime"] = mtime
-                # Only invalidate adjacency if relations actually changed
-                if new_rels:
-                    adjacency_cache.update(
-                        outbound=None, inbound=None, mtime=0.0,
-                    )
-                maybe_evict_caches()
-                return existing
+        result = _try_incremental_load(graph_path, mtime, prev_offset)
+        if result is not None:
+            return result
 
-    entities, _ = _do_full_parse(graph_path, mtime)
-    return entities
+    return _full_load(graph_path, mtime)
 
 
 def load_graph_relations(memory_dir):
@@ -486,12 +497,12 @@ def check_graph_size(memory_dir):
 
 
 def append_jsonl(memory_dir, entries, do_fsync=True):
-    """Append JSONL lines under lock. O(1) for new entries."""
+    """Append JSONL lines under lock; fsync after lock release."""
     graph_path = os.path.join(memory_dir, "graph.jsonl")
+    lines = []
     with GraphLock(memory_dir) as lock:
         if not lock.acquired:
             return False
-        lines = []
         for e in entries:
             try:
                 lines.append(_fast_dumps(e) + "\n")
@@ -502,35 +513,53 @@ def append_jsonl(memory_dir, entries, do_fsync=True):
         with open(graph_path, "a", encoding="utf-8") as f:
             f.writelines(lines)
             f.flush()
-            if do_fsync:
+    if do_fsync and lines:
+        try:
+            with open(graph_path, "a", encoding="utf-8") as f:
                 os.fsync(f.fileno())
+        except OSError:
+            pass
     return True
+
+
+def _build_rewrite_line(entry_type, name_or_r, info_or_none):
+    """Build one JSONL line for rewrite_graph."""
+    if entry_type == "entity":
+        if not name_or_r or not isinstance(name_or_r, str):
+            return None
+        entry = {"type": "entity", "name": name_or_r}
+        entry.update(info_or_none)
+    else:
+        if not info_or_none.get("from") or not info_or_none.get("to"):
+            return None
+        entry = {"type": "relation"}
+        entry.update(info_or_none)
+    try:
+        return _fast_dumps(entry) + "\n"
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def rewrite_graph(memory_dir, entities_dict, relations):
     """Atomic rewrite: temp file + fsync + os.replace."""
     graph_path = os.path.join(memory_dir, "graph.jsonl")
     tmp = graph_path + ".new"
+    dropped = 0
 
     def _lines():
+        nonlocal dropped
         for name, info in entities_dict.items():
-            if not name or not isinstance(name, str):
+            line = _build_rewrite_line("entity", name, info)
+            if line is None:
+                dropped += 1
                 continue
-            entry = {"type": "entity", "name": name}
-            entry.update(info)
-            try:
-                yield _fast_dumps(entry) + "\n"
-            except (TypeError, ValueError, OverflowError):
-                continue
+            yield line
         for r in relations:
-            if not r.get("from") or not r.get("to"):
+            line = _build_rewrite_line("relation", None, r)
+            if line is None:
+                dropped += 1
                 continue
-            entry = {"type": "relation"}
-            entry.update(r)
-            try:
-                yield _fast_dumps(entry) + "\n"
-            except (TypeError, ValueError, OverflowError):
-                continue
+            yield line
 
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -543,6 +572,9 @@ def rewrite_graph(memory_dir, entities_dict, relations):
         except OSError:
             pass
         raise
+
+    if dropped > 0:
+        sys.stderr.write(f"warn: rewrite_graph dropped {dropped} invalid lines\n")
 
     with GraphLock(memory_dir) as lock:
         if not lock.acquired:

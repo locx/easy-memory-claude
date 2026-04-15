@@ -53,7 +53,7 @@ def init_recall_state(memory_dir):
 
 
 def maybe_reload_recall_counts():
-    """Reload if file changed (throttled to 1 stat/interval)."""
+    """Reload if file changed, using mtime+file-offset for last-writer-wins."""
     global recall_mtime, _last_recall_check
     if not recall_path:
         return
@@ -62,7 +62,9 @@ def maybe_reload_recall_counts():
         return
     _last_recall_check = now
     try:
-        mtime = os.path.getmtime(recall_path)
+        st = os.stat(recall_path)
+        mtime = st.st_mtime
+        file_size = st.st_size
     except OSError:
         return
     if mtime == recall_mtime:
@@ -72,13 +74,12 @@ def maybe_reload_recall_counts():
             with open(recall_path, encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
+                # Last-writer-wins: file is authoritative when mtime advanced.
+                # Completely replace in-memory counts with file contents so
+                # pruning from another process can reduce counts here too.
+                recall_counts.clear()
                 for k, v in data.items():
-                    if not isinstance(k, str):
-                        continue
-                    if not isinstance(v, (int, float)):
-                        continue
-                    cur = recall_counts.get(k, 0)
-                    if v > cur:
+                    if isinstance(k, str) and isinstance(v, (int, float)):
                         recall_counts[k] = v
             recall_mtime = mtime
         except (OSError, json.JSONDecodeError, ValueError):
@@ -100,7 +101,7 @@ def record_recalls(entity_names):
 
 
 def flush_recall_counts():
-    """Atomic write of recall counts to disk (no fsync — non-critical)."""
+    """Atomic write of recall counts to disk. fsync runs after lock release."""
     global recall_dirty, recall_last_flush, recall_mtime
     if not recall_path:
         with _recall_lock:
@@ -112,23 +113,22 @@ def flush_recall_counts():
         if not recall_dirty:
             return
         recall_last_flush = time.monotonic()
-        tmp = recall_path + ".tmp"
+        snapshot = dict(recall_counts)
+        recall_dirty = False
+
+    tmp = recall_path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, separators=(",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, recall_path)
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(
-                    recall_counts, f,
-                    separators=(",", ":"),
-                )
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, recall_path)
-            recall_dirty = False
-            try:
-                recall_mtime = os.path.getmtime(recall_path)
-            except OSError:
-                pass
+            recall_mtime = os.path.getmtime(recall_path)
         except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            pass
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass

@@ -5,6 +5,7 @@ Safe anchor for all modules — imports nothing from the package.
 import os
 import re
 import sys
+import threading
 import time
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -108,6 +109,7 @@ MAIN_BRANCHES = frozenset({
 })
 _BRANCH_CHECK_INTERVAL = 60.0
 
+_branch_lock = threading.Lock()
 _current_branch = ""
 _branch_check_mono = 0.0
 _project_dir = ""
@@ -134,25 +136,27 @@ def init_branch(project_dir):
     """Seed branch state at startup."""
     global _project_dir, _current_branch
     global _branch_check_mono
-    _project_dir = project_dir
-    _current_branch = (
-        _read_git_head(project_dir) or "unknown"
-    )
-    _branch_check_mono = time.monotonic()
+    with _branch_lock:
+        _project_dir = project_dir
+        _current_branch = (
+            _read_git_head(project_dir) or "unknown"
+        )
+        _branch_check_mono = time.monotonic()
 
 
 def refresh_branch():
     """Re-read branch if interval expired. Returns (branch, changed)."""
     global _current_branch, _branch_check_mono
     now = time.monotonic()
-    if now - _branch_check_mono < _BRANCH_CHECK_INTERVAL:
-        return _current_branch, False
-    _branch_check_mono = now
-    branch = _read_git_head(_project_dir) or "unknown"
-    changed = branch != _current_branch
-    if changed:
-        _current_branch = branch
-    return _current_branch, changed
+    with _branch_lock:
+        if now - _branch_check_mono < _BRANCH_CHECK_INTERVAL:
+            return _current_branch, False
+        _branch_check_mono = now
+        branch = _read_git_head(_project_dir) or "unknown"
+        changed = branch != _current_branch
+        if changed:
+            _current_branch = branch
+        return _current_branch, changed
 
 
 def get_current_branch():

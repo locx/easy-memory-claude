@@ -21,7 +21,7 @@ from .config import (
 from .cache import entity_cache as _ec
 from .graph import load_index, load_graph_entities
 from .recall import (
-    maybe_reload_recall_counts, record_recalls,
+    maybe_reload_recall_counts, record_recalls, recall_counts,
 )
 
 # Import search-quality enhancers from modular components
@@ -36,34 +36,13 @@ try:
         normalize_type,
     )
     _HAS_STEMMING = True
-except ImportError:
-    _HAS_STEMMING = False
-    try:
-        sys.stderr.write(
-            "[memory] warn: stemming/synonyms unavailable "
-            "— search quality degraded\n"
-        )
-    except OSError:
-        pass
+except ImportError as _import_err:
+    raise ImportError(
+        f"[memory] stem/text modules required but unavailable: {_import_err}"
+    )
 
-    def _stem(w):
-        return w
-
-    def _expand_synonyms(w):
-        return w
-
-    def _make_bigrams(tokens):
-        return []
-
-    _STOPWORDS = frozenset()
-
-    def _filter_token(w):
-        return len(w) >= 2
-
-    def normalize_type(etype):
-        if not isinstance(etype, str):
-            etype = str(etype)
-        return etype.lower().strip()
+MIN_SIM_THRESHOLD = 0.001
+_HEBBIAN_ALPHA = 0.1
 
 # Alias cache: reload when aliases.json mtime changes
 _alias_cache = {"map": None, "mtime": 0.0, "dir": ""}
@@ -94,6 +73,7 @@ def _tokenize_query(query_str, alias_map=None):
         expand = lambda w: alias_map.get(w, w)
     else:
         expand = _expand_synonyms
+    # stem then expand — matches indexer order (maintenance.py:148)
     stemmed = [expand(_stem(w)) for w in raw]
     # Include bigrams for compound-term matching
     bigrams = _make_bigrams(stemmed)
@@ -101,10 +81,15 @@ def _tokenize_query(query_str, alias_map=None):
 
 
 def _branch_boost(entity_branch, current_branch, sim):
-    """Smooth branch relevance factor (no hard cliff)."""
-    if not entity_branch or not current_branch or entity_branch == current_branch:
+    """Smooth branch relevance factor (no hard cliff).
+
+    Empty entity_branch is treated as 'main' (the default branch).
+    """
+    eff_entity = entity_branch if entity_branch else "main"
+    eff_current = current_branch if current_branch else "main"
+    if eff_entity == eff_current:
         return 1.0
-    max_penalty = 0.05 if entity_branch in MAIN_BRANCHES else 0.20
+    max_penalty = 0.05 if eff_entity in MAIN_BRANCHES else 0.20
     penalty = max_penalty * (1.0 - min(sim, 1.0))
     return 1.0 - penalty
 
@@ -171,12 +156,13 @@ def _score_candidates(query_vec, mag_q, candidates, vectors, magnitudes, metadat
         if mag_b == 0:
             continue
         sim = dot / (mag_q * mag_b)
-        if sim > 0.001 and math.isfinite(sim):
+        if sim > MIN_SIM_THRESHOLD and math.isfinite(sim):
             entity_branch = metadata.get(name, {}).get("_branch", "")
             if not entity_branch and _ec["data"] and name in _ec["data"]:
                 entity_branch = _ec["data"][name].get("_branch", "")
             boost = _branch_boost(entity_branch, current_branch, sim)
-            adj_sim = sim * boost
+            rc = recall_counts.get(name, 0)
+            adj_sim = sim * boost * (1.0 + _HEBBIAN_ALPHA * math.log1p(rc))
             if len(heap) < top_k:
                 heapq.heappush(heap, (adj_sim, sim, boost, name))
             elif adj_sim > heap[0][0]:
@@ -249,7 +235,6 @@ def search(query, memory_dir, top_k=5, branch=None, compact=False):
     log_event("SEARCH", f'query="{query[:60]}" results={len(results)} latency={int((_time.monotonic() - _t0)*1000)}ms')
 
     return {"results": results, "total_indexed": len(vectors), "current_branch": current_branch}
-
 
 
 def search_by_time(memory_dir, since=None, until=None, limit=20, branch_filter=None, entity_type=None):

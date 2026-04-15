@@ -16,9 +16,19 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
+# P15: Honor NO_COLOR and TERM=dumb
+_USE_ANSI = (
+    sys.stdout.isatty()
+    and not os.environ.get("NO_COLOR")
+    and os.environ.get("TERM", "") != "dumb"
+)
+
+# P7: read-only commands that skip bootstrap when memory_dir exists
+_READ_ONLY_CMDS = {"search", "recall", "status", "list", "diff", "doctor"}
+
 
 def _resolve_memory_dir(argv):
-    """Extract memory_dir from --memory-dir flag, env, or cwd."""
+    """Extract memory_dir from --memory-dir flag (both = and space forms), env, or cwd."""
     md = None
     cleaned = []
     i = 0
@@ -61,7 +71,22 @@ def _usage():
         "  rebuild                 "
         "Rebuild TF-IDF index\n"
         "  diff                    "
-        "Changes since last session",
+        "Changes since last session\n"
+        "\nFlags:\n"
+        "  --memory-dir DIR        "
+        "Override memory directory\n"
+        "  --mode MODE             "
+        "Search mode: semantic|temporal|graph\n"
+        "  --since DATE            "
+        "Filter entities updated since DATE\n"
+        "  --depth N               "
+        "Graph traversal depth (default 2)\n"
+        "  --type TYPE             "
+        "Filter by entity type\n"
+        "  --compact               "
+        "Compact output (fewer observations)\n"
+        "  --top-k N               "
+        "Max results to return (default 5)",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -96,7 +121,11 @@ def _parse_positional(args):
             try:
                 result["top_k"] = int(args[i])
             except ValueError:
-                pass
+                # P16: warn on bad value
+                print(
+                    f"Warning: --top-k requires an integer, got {args[i]!r}",
+                    file=sys.stderr,
+                )
         elif arg == "--mode" and i + 1 < len(args):
             i += 1
             result["mode"] = args[i]
@@ -111,7 +140,10 @@ def _parse_positional(args):
             try:
                 result["depth"] = int(args[i])
             except ValueError:
-                pass
+                print(
+                    f"Warning: --depth requires an integer, got {args[i]!r}",
+                    file=sys.stderr,
+                )
         elif not arg.startswith("--"):
             positionals.append(arg)
         i += 1
@@ -122,66 +154,14 @@ def _parse_positional(args):
 
 # --- Pending sidecar merge ---
 
-def _do_merge(merging, graph):
-    """Read merging file, append to graph, delete merging."""
-    try:
-        size = os.path.getsize(merging)
-    except OSError:
-        return
-    if size > 50 * 1024 * 1024:
-        sys.stderr.write(
-            f"Error: Pending merge file {merging} "
-            f"exceeds 50MB limit. Skipping.\n"
-        )
-        try:
-            os.unlink(merging)
-        except OSError:
-            pass
-        return
-
-    try:
-        with open(merging, "rb") as src:
-            data = src.read()
-        if not data:
-            os.unlink(merging)
-            return
-        if not data.endswith(b"\n"):
-            data += b"\n"
-        with open(graph, "ab") as dst:
-            dst.write(data)
-            dst.flush()
-            os.fsync(dst.fileno())
-        try:
-            os.unlink(merging)
-        except OSError:
-            try:
-                with open(merging, "w"):
-                    pass
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-
 def _merge_pending(memory_dir):
-    """Merge .pending sidecar into graph.jsonl.
-
-    Atomic rename prevents TOCTOU with concurrent hook
-    writers. Recovers orphaned .merging from crash.
-    """
-    pending = os.path.join(
-        memory_dir, "graph.jsonl.pending"
-    )
-    merging = pending + ".merging"
-    graph = os.path.join(memory_dir, "graph.jsonl")
-
-    _do_merge(merging, graph)
-
-    try:
-        os.rename(pending, merging)
-    except OSError:
-        return
-    _do_merge(merging, graph)
+    """Merge .pending sidecar into graph.jsonl via io_utils.merge_pending."""
+    from pathlib import Path
+    from semantic_server.io_utils import merge_pending
+    mem = Path(memory_dir)
+    graph = mem / "graph.jsonl"
+    pending = graph.with_suffix(".jsonl.pending")
+    merge_pending(mem, graph, pending, lock=None, invalidate_cb=None)
 
 
 # --- Doctor ---
@@ -314,7 +294,7 @@ def _run_doctor(memory_dir):
         "issue_count": len(issues),
     }
 
-    if sys.stdout.isatty():
+    if _USE_ANSI:
         print(f"\n\033[1mMemory Doctor\033[0m — {status}")
         g = result["graph"]
         print(
@@ -339,10 +319,11 @@ def _unified_search(a, memory_dir):
     from semantic_server.traverse import traverse_relations
 
     mode = a.get("mode", "semantic")
+    top_k = a.get("top_k", 5)
     if mode == "temporal":
         return search_by_time(
             memory_dir, a.get("since"), a.get("until"),
-            a.get("limit", 20),
+            top_k,
             branch_filter=a.get("branch_filter"),
             entity_type=a.get("entity_type"),
         )
@@ -353,7 +334,6 @@ def _unified_search(a, memory_dir):
         )
 
     query = a.get("query", "")
-    top_k = a.get("top_k", 5)
 
     return search(
         query, memory_dir, top_k=top_k,
@@ -496,6 +476,9 @@ def _unified_remove(a, memory_dir):
             a.get("entity", ""), a.get("observations", []),
             memory_dir,
         )
+    # P10: require explicit action: "delete"
+    if action != "delete":
+        return {"error": "missing action"}
     names = (
         a.get("entity_names", [])
         or ([a.get("entity")] if a.get("entity") else [])
@@ -608,7 +591,7 @@ def _run_diff(memory_dir):
                  "timestamp": updated}
             )
 
-    if sys.stdout.isatty():
+    if _USE_ANSI:
         total = (len(new_entities) + len(updated_entities)
                  + len(new_decisions) + len(resolved_decisions))
         if total == 0:
@@ -667,10 +650,10 @@ def _run_diff(memory_dir):
 
 # --- TTY formatting ---
 
-def _format_tty_output(tool_name, result):
+def _format_tty_output(tool_name, result, top_k=5):
     """Format result for human-readable TTY output."""
     if tool_name in ("search", "recall"):
-        res_list = result.get("results", [])
+        res_list = result.get("results", [])[:top_k]
         print(
             f"Search "
             f"({result.get('total_indexed', 0)} indexed):"
@@ -684,8 +667,11 @@ def _format_tty_output(tool_name, result):
                 f"({etype}) [score: {score:.2f}]"
             )
             if "observations" in r:
-                for obs in r["observations"]:
-                    print(f"    \u2022 {obs}")
+                obs = r["observations"]
+                for o in obs[:3]:
+                    print(f"    \u2022 {o}")
+                if len(obs) > 3:
+                    print(f"    \u2022 \u2026 +{len(obs) - 3} more")
             if "connected" in r:
                 conns = [
                     f"{c.get('relation', '--')}->"
@@ -761,23 +747,23 @@ def main():
 
     tool_args = _parse_tool_args(tool_name, extra_args)
 
-    # --- Auto-Init ---
-    was_missing = not os.path.isdir(memory_dir)
-
-    # Shared bootstrap: ensure dir, init branch + recall + index
-    from semantic_server.bootstrap import bootstrap
-    if not bootstrap(memory_dir, load_index_on_start=False):
-        print(
-            f"Error: Could not initialize MEMORY_DIR {memory_dir}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    if was_missing and sys.stdout.isatty():
-        print(
-            f"Initialized knowledge graph at {memory_dir}",
-            file=sys.stderr,
-        )
+    # P7: skip bootstrap for read-only commands when dir exists
+    if tool_name in _READ_ONLY_CMDS and os.path.isdir(memory_dir):
+        pass
+    else:
+        was_missing = not os.path.isdir(memory_dir)
+        from semantic_server.bootstrap import bootstrap
+        if not bootstrap(memory_dir, load_index_on_start=False):
+            print(
+                f"Error: Could not initialize MEMORY_DIR {memory_dir}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if was_missing and _USE_ANSI:
+            print(
+                f"Initialized knowledge graph at {memory_dir}",
+                file=sys.stderr,
+            )
 
     # Merge pending sidecar before any reads
     _merge_pending(memory_dir)
@@ -785,11 +771,20 @@ def main():
     # --- Commands that don't need semantic_server ---
     if tool_name == "rebuild":
         import maintenance
-        indexed = maintenance.rebuild_index(memory_dir)
-        print(json.dumps({
-            "rebuilt": indexed > 0,
-            "indexed": indexed,
-        }))
+        # P2: mark dirty and defer; --rebuild-now for immediate
+        if "--rebuild-now" in extra_args:
+            indexed = maintenance.rebuild_index(memory_dir)
+            print(json.dumps({
+                "rebuilt": indexed > 0,
+                "indexed": indexed,
+            }))
+        else:
+            dirty = os.path.join(memory_dir, ".index-dirty")
+            try:
+                open(dirty, "a").close()
+            except OSError:
+                pass
+            print(json.dumps({"queued": True, "hint": "index will rebuild at next maintenance run; use --rebuild-now for immediate"}))
         return
 
     if tool_name == "doctor":
@@ -832,30 +827,30 @@ def main():
 
     try:
         result = handler(tool_args)
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception as exc:
         print(
             json.dumps({"error": str(exc)}, indent=2)
         )
         sys.exit(1)
 
+    top_k = tool_args.get("top_k", 5)
+
     # TTY human-readable formatting or raw JSON
-    if (sys.stdout.isatty() and isinstance(result, dict)
+    if (_USE_ANSI and isinstance(result, dict)
             and not result.get("error")):
-        _format_tty_output(tool_name, result)
+        _format_tty_output(tool_name, result, top_k=top_k)
     else:
         print(json.dumps(result, indent=2))
 
-    # Rebuild index after write ops
+    # P2: mark index dirty after write ops; skip synchronous rebuild
     if tool_name in ("write", "decide", "remove"):
+        dirty = os.path.join(memory_dir, ".index-dirty")
         try:
-            import maintenance
-            maintenance.rebuild_index(memory_dir)
-        except Exception as exc:
-            print(
-                f"Warning: index rebuild failed: "
-                f"{exc}",
-                file=sys.stderr,
-            )
+            open(dirty, "a").close()
+        except OSError:
+            pass
 
     # Flush recall counts
     try:

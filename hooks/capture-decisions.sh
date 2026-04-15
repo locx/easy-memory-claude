@@ -9,42 +9,64 @@
 SAFE_SID="${CLAUDE_SESSION_ID//[^a-zA-Z0-9_-]/_}"
 MARKER="/tmp/.claude-mem-reminded-${SAFE_SID}"
 
+# Time-based throttle: re-nudge if >30 min since last
 if [ -f "$MARKER" ]; then
-    exit 0
+    LAST=$(date -r "$MARKER" +%s 2>/dev/null \
+        || stat -c%Y "$MARKER" 2>/dev/null \
+        || python3 -c "import os,sys; print(int(os.path.getmtime(sys.argv[1])))" "$MARKER" 2>/dev/null \
+        || echo 0)
+    AGE=$(( $(date +%s) - ${LAST:-0} ))
+    if [ "$AGE" -lt 1800 ]; then
+        exit 0
+    fi
 fi
 
 touch "$MARKER"
 
-# Count session activity to calibrate prompt
+# Stamp session-start timestamp here (Stop hook) for next session's diff
 MEMORY_DIR="${CLAUDE_PROJECT_DIR}/.memory"
-GRAPH="${MEMORY_DIR}/graph.jsonl"
 LAST_START="${MEMORY_DIR}/.last-session-start"
+python3 -c "import time; open('${LAST_START}','w').write(time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))" 2>/dev/null || true
+
+# Count session activity to calibrate prompt
+GRAPH="${MEMORY_DIR}/graph.jsonl"
 ACTIVITY=""
 if [ -f "$LAST_START" ] && [ -f "$GRAPH" ]; then
     START_TS=$(cat "$LAST_START" 2>/dev/null || echo "")
     if [ -n "$START_TS" ]; then
-        # Count entities updated since session start
-        UPDATED=$(python3 -c "
-import json, sys
-ts='$START_TS'
-n=u=0
+        # Count entities updated since session start (env-var pattern — no shell interpolation)
+        UPDATED=$(GRAPH_PATH="$GRAPH" SESSION_START="$START_TS" python3 - <<'PYEOF'
+import json, os, sys
+ts = os.environ.get('SESSION_START', '')
+graph = os.environ.get('GRAPH_PATH', '')
+n = u = 0
 try:
-    for line in open('$GRAPH'):
-        line=line.strip()
-        if not line: continue
+    for line in open(graph, encoding='utf-8', errors='replace'):
+        line = line.strip()
+        if not line:
+            continue
         try:
-            obj=json.loads(line)
-            if obj.get('type')!='entity': continue
-            c=obj.get('_created','')
-            up=obj.get('_updated','')
-            if c and c>ts: n+=1
-            elif up and up>ts: u+=1
-        except: pass
-except: pass
+            obj = json.loads(line)
+            if obj.get('type') != 'entity':
+                continue
+            c = obj.get('_created', '')
+            up = obj.get('_updated', '')
+            if c and c > ts:
+                n += 1
+            elif up and up > ts:
+                u += 1
+        except Exception:
+            pass
+except Exception:
+    pass
 print(f'{n},{u}')
-" 2>/dev/null || echo "0,0")
+PYEOF
+        2>/dev/null || echo "0,0")
         NEW_C=$(echo "$UPDATED" | cut -d, -f1)
         UPD_C=$(echo "$UPDATED" | cut -d, -f2)
+        # Numeric guards: treat non-numeric values as 0
+        NEW_C=$(( ${NEW_C:-0} + 0 )) 2>/dev/null || NEW_C=0
+        UPD_C=$(( ${UPD_C:-0} + 0 )) 2>/dev/null || UPD_C=0
         if [ "$NEW_C" -gt 0 ] || [ "$UPD_C" -gt 0 ]; then
             ACTIVITY="This session: +${NEW_C} new entities, ~${UPD_C} updated."
         fi

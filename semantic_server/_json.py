@@ -14,10 +14,10 @@ try:
         except _orjson.JSONDecodeError as exc:
             raise ValueError(str(exc)) from exc
 
-    def dumps(obj, separators=None):
+    def dumps(obj):
         return _orjson.dumps(obj).decode("utf-8")
 
-    def dump(obj, f, separators=None):
+    def dump(obj, f):
         f.write(_orjson.dumps(obj).decode("utf-8"))
 
     def load(f):
@@ -34,19 +34,11 @@ except ImportError:
     def loads(s):
         return _json.loads(s)
 
-    def dumps(obj, separators=None):
-        if separators is None:
-            separators = (",", ":")
-        return _json.dumps(
-            obj, separators=separators,
-        )
+    def dumps(obj):
+        return _json.dumps(obj, separators=(",", ":"))
 
-    def dump(obj, f, separators=None):
-        if separators is None:
-            separators = (",", ":")
-        _json.dump(
-            obj, f, separators=separators,
-        )
+    def dump(obj, f):
+        _json.dump(obj, f, separators=(",", ":"))
 
     def load(f):
         return _json.load(f)

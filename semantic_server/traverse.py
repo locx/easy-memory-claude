@@ -63,6 +63,7 @@ def _expand_frontier(frontier, direction, outbound, inbound, visited, seen_edges
                 continue
             seen_edges.add(edge_key)
             target = to if fr == node else fr
+            # Skip self-loops before appending
             if target == node:
                 continue
             edges.append({"from": fr, "to": to, "relationType": rt})
@@ -77,7 +78,8 @@ def _expand_frontier(frontier, direction, outbound, inbound, visited, seen_edges
 
 def traverse_relations(entity, memory_dir,
                        direction="both",
-                       max_depth=2):
+                       max_depth=2,
+                       obs_per_node=3):
     """BFS traversal with visited-set cap."""
     try:
         max_depth = min(max(int(max_depth), 1), 5)
@@ -94,6 +96,8 @@ def traverse_relations(entity, memory_dir,
             "error": "Graph file not found",
             "nodes": [],
             "edges": [],
+            "reached_depth": 0,
+            "max_visited_hit": False,
         }
 
     entities = load_graph_entities(memory_dir)
@@ -102,6 +106,8 @@ def traverse_relations(entity, memory_dir,
             "error": "Graph is empty or unreadable",
             "nodes": [],
             "edges": [],
+            "reached_depth": 0,
+            "max_visited_hit": False,
         }
 
     outbound, inbound = _get_adjacency(memory_dir)
@@ -111,6 +117,8 @@ def traverse_relations(entity, memory_dir,
             "error": f"Entity '{entity}' not found",
             "nodes": [],
             "edges": [],
+            "reached_depth": 0,
+            "max_visited_hit": False,
         }
 
     visited = {entity}
@@ -118,9 +126,12 @@ def traverse_relations(entity, memory_dir,
     seen_edges = set()
     edges = []
     capped = False
+    reached_depth = 0
 
     for _depth in range(max_depth):
         frontier, capped = _expand_frontier(frontier, direction, outbound, inbound, visited, seen_edges, edges)
+        if frontier or capped:
+            reached_depth = _depth + 1
         if not frontier or capped:
             break
 
@@ -130,10 +141,15 @@ def traverse_relations(entity, memory_dir,
         nodes.append({
             "name": name,
             "entityType": normalize_type(info.get("entityType", "")),
-            "observations": info.get("observations", [])[:3],
+            "observations": info.get("observations", [])[:obs_per_node],
         })
 
-    result = {"nodes": nodes, "edges": edges}
+    result = {
+        "nodes": nodes,
+        "edges": edges,
+        "reached_depth": reached_depth,
+        "max_visited_hit": capped,
+    }
     if capped:
         result["truncated"] = True
         result["max_visited"] = _MAX_VISITED

@@ -3,6 +3,7 @@
 
 Usage: python3 capture_tool_context.py <input_json> <graph_path>
 """
+import hashlib
 import json
 import os
 import sys
@@ -20,12 +21,11 @@ def _check_file_warnings(graph_path, filename, session_id):
         c if c.isalnum() or c in ('_', '-')
         else '_' for c in session_id
     )[:64]
-    safe_file = "".join(
-        c if c.isalnum() or c in ('_', '-')
-        else '_' for c in os.path.basename(filename)
-    )[:64]
+    # Key marker by sha256 of full absolute path to avoid basename collisions
+    abs_path = os.path.abspath(filename)
+    path_hash = hashlib.sha256(abs_path.encode()).hexdigest()[:16]
     marker = (
-        f"/tmp/.claude-mem-warned-{safe_sid}-{safe_file}"
+        f"/tmp/.claude-mem-warned-{safe_sid}-{path_hash}"
     )
     try:
         marker_age = time.time() - os.path.getmtime(marker)
@@ -36,7 +36,7 @@ def _check_file_warnings(graph_path, filename, session_id):
         pass  # marker doesn't exist — proceed
 
     basename = os.path.basename(filename)
-    match_names = {basename, filename}
+    match_names = {basename, filename, abs_path}
 
     warnings = []
     decisions = []
@@ -51,6 +51,11 @@ def _check_file_warnings(graph_path, filename, session_id):
             for line in f:
                 line_count += 1
                 if line_count > _WARN_SCAN_LINE_BUDGET:
+                    print(
+                        f"[capture_tool_context] scan capped at "
+                        f"{_WARN_SCAN_LINE_BUDGET} lines for {basename}",
+                        file=sys.stderr,
+                    )
                     break
                 line = line.strip()
                 if not line:
@@ -149,7 +154,14 @@ def main():
         graph_path, file_path, session_id
     )
     if warning_text:
-        print(warning_text)
+        # Emit via hookSpecificOutput JSON so PostToolUse output is not swallowed
+        payload = {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": warning_text,
+            }
+        }
+        print(json.dumps(payload))
 
 
 if __name__ == '__main__':
